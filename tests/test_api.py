@@ -9,6 +9,10 @@ from wewln_phonecaller.storage import Database
 
 TOKEN = "x" * 40
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+NOTION_DBS = {
+    f"notion_{name}_db": str(i) * 32
+    for i, name in enumerate(("campaigns", "contacts", "jobs", "results"), start=1)
+}
 
 
 @pytest.fixture
@@ -72,7 +76,7 @@ async def test_ready_is_503_without_database_and_does_not_create_it(build_client
 
 async def test_ready_reports_configured_notion_without_the_token(build_client):
     notion_token = "secret_" + "n" * 40
-    client = await build_client(notion_enabled=True, notion_token=notion_token)
+    client = await build_client(notion_enabled=True, notion_token=notion_token, **NOTION_DBS)
     resp = await client.get("/ready")
     assert resp.status == 200
     assert (await resp.json())["checks"]["notion"]["status"] == "configured"
@@ -99,7 +103,9 @@ async def test_wrong_credentials_are_rejected(build_client, header):
 
 async def test_info_with_token_contains_no_secrets(build_client):
     notion_token = "secret_" + "n" * 40
-    client = await build_client(api_token=TOKEN, notion_enabled=True, notion_token=notion_token)
+    client = await build_client(
+        api_token=TOKEN, notion_enabled=True, notion_token=notion_token, **NOTION_DBS
+    )
     resp = await client.get("/api/v1/info", headers=AUTH)
     assert resp.status == 200
     text = await resp.text()
@@ -107,7 +113,7 @@ async def test_info_with_token_contains_no_secrets(build_client):
     assert notion_token not in text
     body = await resp.json()
     assert body["settings"]["api_token"] == "set"
-    assert body["settings"]["notion_token"] == "set"
+    assert body["settings"]["notion_token"] == "set (argument)"
     assert body["real_calls"]["allowed"] is False
 
 
@@ -150,3 +156,104 @@ async def test_unhandled_error_is_generic_and_logged(build_client, caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert "unhandled_error" in messages
     assert "http_request" in messages
+
+
+async def wait_until(condition, seconds=10.0):
+    import asyncio
+
+    for _ in range(int(seconds / 0.02)):
+        if condition():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def notion_app(aiohttp_client, world, make_settings, **overrides):
+    from wewln_phonecaller.notion.sync import NotionSync, SyncService
+
+    settings = make_settings(**{**world.overrides, **overrides})
+    sync = NotionSync(settings, world.repo, client_factory=world.client)
+    service = SyncService(sync, interval=3600)
+    client = await aiohttp_client(create_app(settings, world.repo.db, sync_service=service))
+    assert await wait_until(lambda: sync.last_result is not None)
+    return client, service
+
+
+async def test_ready_stays_200_while_notion_is_down(aiohttp_client, notion_world, make_settings):
+    notion_world.mock.down = True
+    client, _service = await notion_app(aiohttp_client, notion_world, make_settings)
+    resp = await client.get("/ready")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "ready"
+    notion = body["checks"]["notion"]
+    assert notion["status"] == "degraded"
+    assert notion["last_run"]["error_code"] == "notion_unavailable"
+    assert notion["consecutive_failures"] == 1
+
+
+async def test_notion_and_campaign_endpoints(aiohttp_client, notion_world, make_settings):
+    w = notion_world
+    camp = w.campaign()
+    w.contact("Анна", "+994501234567", [camp])
+    client, service = await notion_app(aiohttp_client, w, make_settings, api_token=TOKEN)
+    assert service.status()["status"] == "ok"
+
+    resp = await client.post("/api/v1/notion/sync", headers=AUTH)
+    assert resp.status == 200
+    assert (await resp.json())["status"] == "ok"
+
+    resp = await client.get("/api/v1/campaigns", headers=AUTH)
+    (campaign,) = (await resp.json())["campaigns"]
+    assert campaign["status"] == "running"
+
+    resp = await client.post(
+        f"/api/v1/campaigns/{campaign['id']}/stop", json={"reason": "Тест"}, headers=AUTH
+    )
+    assert resp.status == 200
+    assert (await resp.json())["campaign"]["status"] == "stopped"
+    # The stop wakes the background sync, which tells Notion.
+    assert await wait_until(lambda: w.row(camp)["Статус"] == "Остановлена")
+
+    resp = await client.post("/api/v1/dnc", json={"phone": "+994551112233"}, headers=AUTH)
+    body = await resp.json()
+    assert body["added"] is True
+    assert "551112233" not in body["phone"]
+
+    # Let the background cycle woken by stop/DNC finish before reading the runs.
+    assert await wait_until(lambda: not service.status()["running"])
+    resp = await client.get("/api/v1/notion/status", headers=AUTH)
+    body = await resp.json()
+    assert body["enabled"] is True
+    statuses = [run["status"] for run in body["recent_runs"]]
+    assert statuses
+    assert set(statuses) <= {"ok", "partial", "running"}
+    assert "ok" in statuses
+
+
+async def test_endpoint_input_errors(aiohttp_client, notion_world, make_settings):
+    client, _service = await notion_app(
+        aiohttp_client, notion_world, make_settings, api_token=TOKEN
+    )
+    resp = await client.post(
+        "/api/v1/campaigns/999/stop",
+        data="{not json",
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == "invalid_json"
+    resp = await client.post("/api/v1/campaigns/999/stop", headers=AUTH)
+    assert resp.status == 404
+    resp = await client.post("/api/v1/dnc", json={"phone": "12"}, headers=AUTH)
+    assert resp.status == 400
+    resp = await client.post("/api/v1/dnc", json={}, headers=AUTH)
+    assert (await resp.json())["error"]["code"] == "invalid_input"
+
+
+async def test_sync_endpoint_without_notion(build_client):
+    client = await build_client(api_token=TOKEN)
+    resp = await client.post("/api/v1/notion/sync", headers=AUTH)
+    assert resp.status == 409
+    assert (await resp.json())["error"]["code"] == "notion_disabled"
+    resp = await client.get("/api/v1/notion/status", headers=AUTH)
+    assert (await resp.json())["enabled"] is False
