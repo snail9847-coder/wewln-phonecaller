@@ -4,6 +4,12 @@ from wewln_phonecaller import __version__
 from wewln_phonecaller.cli import main
 
 TOKEN = "z" * 40
+NOTION_DB_ENV = {
+    "WEWLN_NOTION_CAMPAIGNS_DB": "11111111111111111111111111111111",
+    "WEWLN_NOTION_CONTACTS_DB": "22222222222222222222222222222222",
+    "WEWLN_NOTION_JOBS_DB": "33333333333333333333333333333333",
+    "WEWLN_NOTION_RESULTS_DB": "44444444444444444444444444444444",
+}
 
 
 def test_check_config_with_defaults(capsys):
@@ -25,12 +31,14 @@ def test_check_config_never_prints_secrets(monkeypatch, capsys):
     monkeypatch.setenv("WEWLN_API_TOKEN", TOKEN)
     monkeypatch.setenv("WEWLN_NOTION_ENABLED", "true")
     monkeypatch.setenv("WEWLN_NOTION_TOKEN", notion_token)
+    for name, value in NOTION_DB_ENV.items():
+        monkeypatch.setenv(name, value)
     assert main(["check-config"]) == 0
     captured = capsys.readouterr()
     assert TOKEN not in captured.out + captured.err
     assert notion_token not in captured.out + captured.err
     assert "api_token: set" in captured.out
-    assert "notion_token: set" in captured.out
+    assert "notion_token: set (environment variable)" in captured.out
 
 
 def test_rejected_secret_is_not_echoed(monkeypatch, capsys):
@@ -58,7 +66,7 @@ def test_init_db_is_idempotent(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("WEWLN_DATA_DIR", str(tmp_path / "d"))
     assert main(["init-db"]) == 0
     assert main(["init-db"]) == 0
-    assert "(schema version 1)" in capsys.readouterr().out
+    assert "(schema version 2)" in capsys.readouterr().out
     assert (tmp_path / "d" / "wewln.db").is_file()
 
 

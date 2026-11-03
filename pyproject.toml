@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wewln-phonecaller"
-version = "0.1.0"
+version = "0.2.0"
 description = "Russian-language AI voice calling for Windows 10/11, optionally controlled from Notion; simulation-first."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "aiohttp>=3.10,<4",
+  # Windows Credential Manager for the Notion token (other systems: WEWLN_NOTION_TOKEN).
+  "keyring>=25.2,<26; sys_platform == 'win32'",
+  # Phone number validation and E.164 normalization (Google libphonenumber metadata).
+  "phonenumbers>=8.13,<10",
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.4,<3",
   # Windows has no IANA time zone database; zoneinfo needs this package there.

@@ -11,16 +11,35 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .errors import ConfigError
+from .notion.ids import normalize_notion_id
+from .phones import SUPPORTED_REGIONS
+from .secret_store import NOTION_TOKEN_KEY, SecretStore, SecretStoreUnavailable, default_store
 
 ENV_PREFIX = "WEWLN_"
 PRODUCTION_CONFIRM_PHRASE = "I_ACCEPT_REAL_CALLS"
 MIN_API_TOKEN_LENGTH = 32
+NOTION_TOKEN_MIN_LENGTH = 20
+NOTION_TOKEN_MAX_LENGTH = 500
+NOTION_DB_SETTINGS = {
+    "notion_campaigns_db": "WEWLN_NOTION_CAMPAIGNS_DB",
+    "notion_contacts_db": "WEWLN_NOTION_CONTACTS_DB",
+    "notion_jobs_db": "WEWLN_NOTION_JOBS_DB",
+    "notion_results_db": "WEWLN_NOTION_RESULTS_DB",
+}
 # Conversation languages. Russian is mandatory; more languages are added here later.
 SUPPORTED_LANGUAGES: dict[str, str] = {"ru-RU": "Русский"}
 
@@ -58,9 +77,22 @@ class Settings(BaseSettings):
     default_language: str = "ru-RU"
     timezone: str = "UTC"
 
+    # Phone numbers without a country code are read in this region (ISO 3166-1, e.g. AZ).
+    default_phone_region: str | None = None
+
     # Notion is optional: the backend works without it.
     notion_enabled: bool = False
     notion_token: SecretStr | None = None
+    notion_campaigns_db: str | None = None
+    notion_contacts_db: str | None = None
+    notion_jobs_db: str | None = None
+    notion_results_db: str | None = None
+    notion_sync_interval: int = Field(default=60, ge=15, le=86400)
+    notion_api_base_url: str = "https://api.notion.com"
+    notion_timeout: float = Field(default=30.0, ge=1, le=300)
+    notion_max_rps: float = Field(default=2.5, gt=0, le=100)
+
+    _notion_origin: str = PrivateAttr(default="not set")
 
     @field_validator("http_host")
     @classmethod
@@ -74,11 +106,58 @@ class Settings(BaseSettings):
             raise ValueError("must be an IP address or 'localhost'") from exc
         return value
 
-    @field_validator("api_token", "notion_token", mode="before")
+    @field_validator(
+        "api_token",
+        "notion_token",
+        "default_phone_region",
+        *NOTION_DB_SETTINGS,
+        mode="before",
+    )
     @classmethod
-    def _blank_secret_is_unset(cls, value: Any) -> Any:
+    def _blank_is_unset(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("notion_token")
+    @classmethod
+    def _check_notion_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None:
+            check_notion_token_format(value.get_secret_value())
+        return value
+
+    @field_validator(*NOTION_DB_SETTINGS)
+    @classmethod
+    def _check_notion_db(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalize_notion_id(value)
+        except ValueError as exc:
+            raise ValueError("must be a Notion database ID or a link to the database") from exc
+
+    @field_validator("notion_api_base_url")
+    @classmethod
+    def _check_notion_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        if parts.scheme not in {"https", "http"} or not host:
+            raise ValueError("must be an https:// URL")
+        if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+            raise ValueError("must contain only the scheme, host and port")
+        if parts.scheme == "http" and not _is_loopback_host(host):
+            raise ValueError("plain http is allowed only for a local mock server (127.0.0.1)")
+        return value
+
+    @field_validator("default_phone_region")
+    @classmethod
+    def _check_region(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().upper()
+        if value not in SUPPORTED_REGIONS:
+            raise ValueError("must be a two-letter country code such as AZ, RU or KZ")
         return value
 
     @field_validator("api_token")
@@ -116,17 +195,35 @@ class Settings(BaseSettings):
             )
         if not self.is_loopback and self.api_token is None:
             problems.append("WEWLN_HTTP_HOST is not a loopback address: set WEWLN_API_TOKEN")
-        if self.notion_enabled and self.notion_token is None:
-            problems.append("WEWLN_NOTION_ENABLED=true requires WEWLN_NOTION_TOKEN")
+        if self.notion_enabled:
+            missing = [env for name, env in NOTION_DB_SETTINGS.items() if not getattr(self, name)]
+            if missing:
+                problems.append(
+                    "WEWLN_NOTION_ENABLED=true requires "
+                    + ", ".join(missing)
+                    + " (create the databases with: wewln notion bootstrap --parent <page>)"
+                )
         if problems:
             raise ValueError(" | ".join(problems))
         return self
 
     @property
     def is_loopback(self) -> bool:
-        if self.http_host == "localhost":
-            return True
-        return ipaddress.ip_address(self.http_host).is_loopback
+        return _is_loopback_host(self.http_host)
+
+    @property
+    def notion_token_source(self) -> str:
+        """Where the Notion token came from: environment, .env file, keyring or not set."""
+        return self._notion_origin if self.notion_token is not None else "not set"
+
+    @property
+    def notion_databases(self) -> dict[str, str | None]:
+        return {
+            "campaigns": self.notion_campaigns_db,
+            "contacts": self.notion_contacts_db,
+            "jobs": self.notion_jobs_db,
+            "results": self.notion_results_db,
+        }
 
     @property
     def resolved_db_path(self) -> Path:
@@ -160,9 +257,40 @@ class Settings(BaseSettings):
             "log_file": str(self.resolved_log_file) if self.resolved_log_file else None,
             "default_language": self.default_language,
             "timezone": self.timezone,
+            "default_phone_region": self.default_phone_region,
             "notion_enabled": self.notion_enabled,
-            "notion_token": "set" if self.notion_token else "not set",
+            "notion_token": (
+                f"set ({self.notion_token_source})" if self.notion_token else "not set"
+            ),
+            "notion_campaigns_db": self.notion_campaigns_db,
+            "notion_contacts_db": self.notion_contacts_db,
+            "notion_jobs_db": self.notion_jobs_db,
+            "notion_results_db": self.notion_results_db,
+            "notion_sync_interval": self.notion_sync_interval,
+            "notion_api_base_url": self.notion_api_base_url,
+            "notion_timeout": self.notion_timeout,
+            "notion_max_rps": self.notion_max_rps,
         }
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_notion_token_format(token: str) -> None:
+    """Shape check only (the value itself is never shown). Raises ValueError."""
+    if any(ch.isspace() for ch in token):
+        raise ValueError("must not contain spaces or line breaks (copy the token again)")
+    if not NOTION_TOKEN_MIN_LENGTH <= len(token) <= NOTION_TOKEN_MAX_LENGTH:
+        raise ValueError(
+            "does not look like a Notion token (expected the value from the connection's "
+            "Configuration tab, usually starting with ntn_)"
+        )
 
 
 def _describe(exc: ValidationError) -> list[str]:
@@ -176,12 +304,49 @@ def _describe(exc: ValidationError) -> list[str]:
     return problems
 
 
-def load_settings(env_file: str | Path | None = ".env", **overrides: Any) -> Settings:
-    """Load and validate settings. Raises ConfigError with readable problems (no secret values)."""
+def load_settings(
+    env_file: str | Path | None = ".env",
+    *,
+    secret_store: SecretStore | None = None,
+    **overrides: Any,
+) -> Settings:
+    """Load and validate settings. Raises ConfigError with readable problems (no secret values).
+
+    The Notion token is taken from (in order) explicit arguments, the environment, the .env file
+    and finally the OS credential store (`wewln notion token set`).
+    """
     try:
-        return Settings(_env_file=env_file, **overrides)
+        settings = Settings(_env_file=env_file, **overrides)
     except ValidationError as exc:
         raise ConfigError(_describe(exc)) from None
+    if settings.notion_token is not None:
+        if "notion_token" in overrides:
+            settings._notion_origin = "argument"
+        elif any(k.upper() == f"{ENV_PREFIX}NOTION_TOKEN" for k in os.environ):
+            settings._notion_origin = "environment variable"
+        else:
+            settings._notion_origin = ".env file"
+    else:
+        store = secret_store if secret_store is not None else default_store()
+        try:
+            stored = store.get(NOTION_TOKEN_KEY)
+        except SecretStoreUnavailable:
+            stored = None
+        if stored:
+            try:
+                check_notion_token_format(stored)
+            except ValueError as exc:
+                raise ConfigError([f"Notion token in the credential store: {exc}"]) from None
+            settings.notion_token = SecretStr(stored)
+            settings._notion_origin = "credential store"
+    if settings.notion_enabled and settings.notion_token is None:
+        raise ConfigError(
+            [
+                "WEWLN_NOTION_ENABLED=true requires a Notion token: run `wewln notion token set` "
+                "(Windows Credential Manager) or set WEWLN_NOTION_TOKEN"
+            ]
+        )
+    return settings
 
 
 def find_unknown_variables(
