@@ -407,15 +407,20 @@ pydantic 2.14.2, phonenumbers 9.0.42, pytest 9.2.0, ruff 0.17.3. С настоя
 - [x] Работа без Notion: локальные кампании, импорт CSV, `jobs list`, `simulate`; при недоступном
   Notion `serve` работает, `/ready` = 200 с `notion.status = degraded`.
 - [x] Имитация Notion API (`notion/mock_server.py`) и тесты: `pytest -q` → **260 passed**
-  (после Phase 2 было 105); `ruff check` → All checks passed; `ruff format --check` →
-  42 files already formatted. Установка `pip install -e ".[dev]"` в чистое окружение и полный
-  прогон тестов — успешно.
+  (после Phase 2 было 105); `ruff check` → All checks passed; `ruff format --check .` →
+  49 files already formatted (42 файла Python и 7 Markdown). Установка `pip install -e ".[dev]"`
+  в чистое окружение и полный прогон тестов — успешно.
 - [x] Ручной прогон на имитации: `notion mock-server --demo` → `notion check` → `notion sync` →
   `simulate` → `notion sync` → `jobs list` (номера маскированы, в логе нет токена и номеров).
 - [x] Документация на русском: [docs/NOTION.md](docs/NOTION.md) (пошаговое подключение,
   статусы, дубли, ограничения API, неполадки), README, ARCHITECTURE, CONFIGURATION, TESTING,
   SECURITY, этот план.
-- [ ] CI в GitHub Actions для PR Phase 3 — результат записывается после запуска.
+- [x] CI в GitHub Actions: PR #2, запуск 41704923806 на коммите `291728e` — все 6 задач `success`:
+  `ubuntu-latest` и `windows-latest` × Python 3.12, 3.13, 3.14 (установка, `ruff check`,
+  `ruff format --check`, `pytest`, `check-config`).
+- [x] Поиск секретов и личных данных перед публикацией: локальный поиск по шаблонам токенов и ключей,
+  адресов почты, путей пользователя и IP — совпадений нет; в тестах только токен имитации
+  `ntn_mock_…` и вымышленные номера.
 - [ ] Проверка на настоящем рабочем пространстве Notion — чек-лист в
   [docs/TESTING.md](docs/TESTING.md); выполняет владелец со своим токеном.
 - Перенесено: история диалога и итоги разговоров — Phase 5; повторные попытки по «Макс.
