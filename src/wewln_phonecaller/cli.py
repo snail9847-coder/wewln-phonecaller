@@ -1,30 +1,56 @@
-"""Command line: `wewln serve | check-config | init-db` (or `python -m wewln_phonecaller`)."""
+"""Command line: `wewln <command>` (or `python -m wewln_phonecaller <command>`).
+
+Messages are in English like the logs; docs/ (Russian) explains every command.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
+import csv
+import getpass
+import io
 import logging
+import os
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
 from . import __version__
 from .api import create_app
-from .config import Settings, find_unknown_variables, load_settings
-from .errors import ConfigError, StorageError
+from .config import (
+    ENV_PREFIX,
+    Settings,
+    check_notion_token_format,
+    find_unknown_variables,
+    load_settings,
+)
+from .domain import CampaignStatus, reason_label
+from .errors import ConfigError, StorageError, WewlnError
 from .logging_setup import setup_logging, shutdown_logging
+from .redact import mask_phone_numbers
 from .safety import evaluate_real_calls
+from .secret_store import NOTION_TOKEN_KEY, SecretStoreUnavailable, default_store
 from .storage import Database
+from .storage.repository import ContactInput, Repository
 
 log = logging.getLogger("wewln.cli")
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
+
+CSV_COLUMNS = {
+    "name": {"name", "имя", "фио", "contact", "контакт"},
+    "phone": {"phone", "телефон", "номер", "phone_number", "номер телефона"},
+    "dnc": {"dnc", "do_not_call", "do not call", "не звонить", "не_звонить"},
+}
+TRUE_WORDS = {"1", "true", "yes", "y", "x", "+", "да", "д"}
 
 
 def _utf8_stdio() -> None:
@@ -45,6 +71,59 @@ def _load(env_file: str | None, **overrides: Any) -> Settings | None:
         for problem in exc.problems:
             print(f"  - {problem}", file=sys.stderr)
         return None
+
+
+def _quiet_logging(settings: Settings) -> None:
+    """One-shot commands log to the log file only; their own output stays readable."""
+    setup_logging(
+        level=settings.log_level,
+        fmt=settings.log_format,
+        log_file=settings.resolved_log_file,
+        secrets=settings.secret_values(),
+        console=False,
+    )
+
+
+def _repository(settings: Settings) -> Repository:
+    db = Database(settings.resolved_db_path)
+    db.migrate()
+    return Repository(
+        db,
+        default_language=settings.default_language,
+        default_region=settings.default_phone_region,
+    )
+
+
+def _with_repository(func: Callable[[argparse.Namespace, Settings, Repository], int]):
+    def command(args: argparse.Namespace) -> int:
+        settings = _load(args.env_file)
+        if settings is None:
+            return EXIT_CONFIG
+        _quiet_logging(settings)
+        return func(args, settings, _repository(settings))
+
+    return command
+
+
+def _table(rows: list[list[Any]], headers: list[str]) -> None:
+    if not rows:
+        print("(nothing)")
+        return
+    cells = [[str(h) for h in headers], *[["" if v is None else str(v) for v in r] for r in rows]]
+    widths = [max(len(row[i]) for row in cells) for i in range(len(headers))]
+    for index, row in enumerate(cells):
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)).rstrip())
+        if index == 0:
+            print("  ".join("-" * w for w in widths))
+
+
+def _phone(value: str | None, unmask: bool) -> str:
+    if not value:
+        return ""
+    return value if unmask else mask_phone_numbers(value)
+
+
+# ---------------------------------------------------------------------- basic commands
 
 
 def cmd_check_config(args: argparse.Namespace) -> int:
@@ -78,6 +157,8 @@ def cmd_init_db(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    from .notion.sync import NotionSync, SyncService
+
     overrides: dict[str, Any] = {}
     if args.host:
         overrides["http_host"] = args.host
@@ -103,6 +184,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 "mode": settings.mode,
                 "telephony_provider": settings.telephony_provider,
                 "real_calls": decision.as_dict(),
+                "notion_enabled": settings.notion_enabled,
             },
         )
     except StorageError as exc:
@@ -110,7 +192,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
         shutdown_logging()
         return EXIT_RUNTIME
 
-    app = create_app(settings, db)
+    sync_service = None
+    if settings.notion_enabled:
+        repo = Repository(
+            db,
+            default_language=settings.default_language,
+            default_region=settings.default_phone_region,
+        )
+        sync_service = SyncService(
+            NotionSync(settings, repo), interval=settings.notion_sync_interval
+        )
+    app = create_app(settings, db, sync_service=sync_service)
 
     async def _record_stop(_app: web.Application) -> None:
         await asyncio.to_thread(db.audit, "app.stop")
@@ -125,10 +217,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
             "mode": settings.mode,
             "schema_version": version,
             "real_calls": decision.as_dict(),
+            "notion_sync_interval_s": settings.notion_sync_interval
+            if settings.notion_enabled
+            else None,
         },
     )
+    notion = "on" if settings.notion_enabled else "off"
     print(
-        f"wewln-phonecaller {__version__} on {url} (mode={settings.mode}). Ctrl+C stops it.",
+        f"wewln-phonecaller {__version__} on {url} (mode={settings.mode}, notion sync {notion})."
+        " Ctrl+C stops it.",
         flush=True,
     )
     try:
@@ -139,6 +236,436 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log.info("server_stopped")
         shutdown_logging()
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------- notion
+
+
+def cmd_notion_token_set(args: argparse.Namespace) -> int:
+    if args.stdin:
+        token = sys.stdin.readline().strip()
+    else:
+        token = getpass.getpass("Paste the Notion token (input stays hidden), then Enter: ").strip()
+    try:
+        check_notion_token_format(token)
+    except ValueError as exc:
+        print(f"The token was not saved: it {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    store = default_store()
+    try:
+        store.set(NOTION_TOKEN_KEY, token)
+    except SecretStoreUnavailable as exc:
+        print(
+            f"The token was not saved: {exc}. Set the WEWLN_NOTION_TOKEN environment variable "
+            "instead (see docs/NOTION.md).",
+            file=sys.stderr,
+        )
+        return EXIT_RUNTIME
+    print(f"Notion token saved in the OS credential store ({store.name}).")
+    if any(k.upper() == f"{ENV_PREFIX}NOTION_TOKEN" for k in os.environ):
+        print("Note: WEWLN_NOTION_TOKEN is set in the environment and takes precedence.")
+    print("Check the connection with: wewln notion check")
+    return EXIT_OK
+
+
+def cmd_notion_token_delete(args: argparse.Namespace) -> int:
+    store = default_store()
+    try:
+        deleted = store.delete(NOTION_TOKEN_KEY)
+    except SecretStoreUnavailable as exc:
+        print(f"Credential store unavailable: {exc}", file=sys.stderr)
+        return EXIT_RUNTIME
+    print("Notion token deleted." if deleted else "No Notion token was stored.")
+    return EXIT_OK
+
+
+def cmd_notion_token_status(args: argparse.Namespace) -> int:
+    settings = _load(args.env_file)
+    if settings is None:
+        return EXIT_CONFIG
+    store = default_store()
+    source = settings.notion_token_source
+    print(f"Notion token: {f'set ({source})' if settings.notion_token else 'not set'}")
+    print(f"Credential store: {store.name}")
+    return EXIT_OK
+
+
+def _notion_settings(args: argparse.Namespace) -> Settings | None:
+    settings = _load(args.env_file)
+    if settings is None:
+        return None
+    if settings.notion_token is None:
+        print(
+            "Notion token is not set: run `wewln notion token set` or set WEWLN_NOTION_TOKEN.",
+            file=sys.stderr,
+        )
+        return None
+    _quiet_logging(settings)
+    return settings
+
+
+def cmd_notion_check(args: argparse.Namespace) -> int:
+    from .notion.client import NotionClient
+    from .notion.setup import database_title, describe_connection, resolve_workspace
+
+    settings = _notion_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+
+    async def run() -> tuple[dict[str, Any], Any]:
+        async with NotionClient.from_settings(settings) as client:
+            who = await describe_connection(client)
+            workspace = await resolve_workspace(
+                client, settings.notion_databases, repair=args.repair
+            )
+        return who, workspace
+
+    who, workspace = asyncio.run(run())
+    print(f"Connected as «{who['name']}» ({who['type']}) to workspace «{who['workspace']}».")
+    for db in workspace.databases.values():
+        state = "ok" if db.report is not None and db.report.ok else "needs attention"
+        if db.repaired:
+            state += " (missing properties or options were added)"
+        print(f"  {db.spec.env_var}: «{database_title(db)}» {state}")
+    blocking = workspace.blocking_problems()
+    for problem in workspace.problems():
+        print(f"  - {problem}")
+    if blocking:
+        print(
+            "The sync cannot run until these problems are fixed"
+            + ("" if args.repair else " (try: wewln notion check --repair)")
+            + ".",
+            file=sys.stderr,
+        )
+        return EXIT_RUNTIME
+    if workspace.problems():
+        print("Missing select options are added by Notion automatically when wewln writes them.")
+    print("Notion is ready for the sync.")
+    return EXIT_OK
+
+
+def _write_env(path: Path, lines: list[str]) -> None:
+    values = dict(line.split("=", 1) for line in lines)
+    existing = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    output: list[str] = []
+    done: set[str] = set()
+    for raw in existing:
+        key = raw.split("=", 1)[0].strip()
+        if "=" in raw and not raw.lstrip().startswith("#") and key in values:
+            output.append(f"{key}={values[key]}")
+            done.add(key)
+        else:
+            output.append(raw)
+    output += [f"{key}={value}" for key, value in values.items() if key not in done]
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def cmd_notion_bootstrap(args: argparse.Namespace) -> int:
+    from .notion.client import NotionClient
+    from .notion.setup import bootstrap, database_title
+
+    settings = _notion_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+
+    async def run() -> Any:
+        async with NotionClient.from_settings(settings) as client:
+            return await bootstrap(client, args.parent)
+
+    workspace = asyncio.run(run())
+    for db in workspace.databases.values():
+        state = "created" if db.created else "found"
+        if db.repaired:
+            state += ", missing properties or options added"
+        print(f"  «{database_title(db)}»: {state}")
+    lines = workspace.env_lines()
+    if args.write_env:
+        if not args.env_file:
+            print("--write-env needs an .env file (do not use --env-file '').", file=sys.stderr)
+            return EXIT_CONFIG
+        _write_env(Path(args.env_file), lines)
+        print(f"Saved the database IDs to {args.env_file}.")
+    else:
+        print("Add these lines to your .env file (or run again with --write-env):")
+        for line in lines:
+            print(f"  {line}")
+    print("Next: wewln notion check, then wewln notion sync (or wewln serve).")
+    return EXIT_OK
+
+
+def cmd_notion_sync(args: argparse.Namespace) -> int:
+    from .notion.sync import NotionSync
+
+    settings = _notion_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    repo = _repository(settings)
+    result = asyncio.run(NotionSync(settings, repo).run_once())
+    print(f"Sync {result.status}.")
+    if result.error_message:
+        print(f"  error: {result.error_message}")
+    for name, value in sorted(result.stats.items()):
+        print(f"  {name}: {value}")
+    for problem in result.problems:
+        print(f"  - {problem}")
+    return EXIT_OK if result.status in ("ok", "partial") else EXIT_RUNTIME
+
+
+def cmd_notion_status(args: argparse.Namespace) -> int:
+    settings = _load(args.env_file)
+    if settings is None:
+        return EXIT_CONFIG
+    repo = _repository(settings)
+    print(f"Notion sync: {'enabled' if settings.notion_enabled else 'disabled'}")
+    runs = repo.recent_sync_runs(args.limit)
+    _table(
+        [
+            [
+                r["started_at"],
+                r["status"],
+                r["error_code"] or "",
+                r["stats"].get("requests", ""),
+                r["stats"].get("problems", 0),
+            ]
+            for r in runs
+        ],
+        ["started (UTC)", "status", "error", "requests", "problems"],
+    )
+    return EXIT_OK
+
+
+def cmd_notion_mock_server(args: argparse.Namespace) -> int:
+    from .notion.mock_server import MockNotionServer, seed_demo
+
+    server = MockNotionServer(port=args.port)
+    try:
+        base_url = server.start()
+    except (OSError, RuntimeError) as exc:
+        print(f"Cannot start the mock server: {exc}", file=sys.stderr)
+        return EXIT_RUNTIME
+    try:
+        demo = asyncio.run(seed_demo(server)) if args.demo else None
+        parent = demo["parent"] if demo else server.mock.add_page("wewln (mock)")
+        print(f"Mock Notion API on {base_url}: an imitation for trials, data is kept in memory.")
+        print("In another terminal (PowerShell) point wewln at it:")
+        print(f'  $env:WEWLN_NOTION_API_BASE_URL = "{base_url}"')
+        print(f'  $env:WEWLN_NOTION_TOKEN = "{server.mock.token}"')
+        if demo:
+            for line in demo["env"]:
+                key, value = line.split("=", 1)
+                print(f'  $env:{key} = "{value}"')
+            print("Then: wewln notion sync; wewln simulate; wewln notion sync; wewln jobs list")
+        else:
+            print(f"Then: wewln notion bootstrap --parent {parent}")
+        print("Ctrl+C stops the mock server.", flush=True)
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return EXIT_OK
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------- campaigns and contacts
+
+
+@_with_repository
+def cmd_campaign_create(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    campaign_id = repo.create_local_campaign(args.name, script=args.script or "")
+    print(
+        f"Campaign {campaign_id} created (draft). Add contacts: wewln contacts import <file.csv> "
+        f"--campaign {campaign_id}"
+    )
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_campaign_list(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    rows = []
+    for c in repo.list_campaigns():
+        jobs = ", ".join(f"{k}={v}" for k, v in sorted(c["jobs"].items()))
+        rows.append(
+            [c["id"], c["source"], c["status"], c["name"], c["members"], jobs, c["problem"]]
+        )
+    _table(rows, ["id", "source", "status", "name", "contacts", "jobs", "problem"])
+    return EXIT_OK
+
+
+def _campaign_status(status: CampaignStatus):
+    @_with_repository
+    def command(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+        report = repo.set_local_campaign_status(args.campaign_id, status)
+        print(f"Campaign {args.campaign_id}: {status.value} ({report.created} job(s) planned).")
+        return EXIT_OK
+
+    return command
+
+
+@_with_repository
+def cmd_campaign_stop(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    report = repo.stop_campaign(args.campaign_id, reason=args.reason or "", source="local")
+    campaign = repo.get_campaign(args.campaign_id)
+    print(
+        f"Campaign {args.campaign_id} is {campaign['status']} ({report.changed} job(s) cancelled)."
+        " A stopped campaign never runs again."
+    )
+    if campaign["source"] == "notion":
+        print("Notion gets the new status on the next sync.")
+    return EXIT_OK
+
+
+def read_contacts_csv(path: Path) -> list[ContactInput]:
+    """CSV from Excel or Google Sheets: UTF-8 (with or without BOM) or Windows-1251; separated
+    by commas, semicolons or tabs; header names in English or Russian."""
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1251", errors="replace")
+    try:
+        dialect: Any = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(io.StringIO(text), dialect)
+    header = next(reader, None)
+    if header is None:
+        raise WewlnError("the file is empty", code="invalid_input", http_status=400)
+    columns: dict[str, int] = {}
+    for index, title in enumerate(header):
+        name = title.strip().lower()
+        for column, aliases in CSV_COLUMNS.items():
+            if name in aliases and column not in columns:
+                columns[column] = index
+    if "phone" not in columns:
+        raise WewlnError(
+            "no phone column: the first row must name the columns, e.g. name;phone;dnc "
+            "(or имя;телефон;не звонить)",
+            code="invalid_input",
+            http_status=400,
+        )
+
+    def cell(row: list[str], column: str) -> str:
+        index = columns.get(column)
+        return row[index].strip() if index is not None and index < len(row) else ""
+
+    contacts = []
+    for row in reader:
+        if not any(value.strip() for value in row):
+            continue
+        contacts.append(
+            ContactInput(
+                line=reader.line_num,
+                name=cell(row, "name"),
+                phone=cell(row, "phone"),
+                dnc=cell(row, "dnc").lower() in TRUE_WORDS,
+            )
+        )
+    return contacts
+
+
+@_with_repository
+def cmd_contacts_import(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    try:
+        rows = read_contacts_csv(Path(args.file))
+    except OSError as exc:
+        print(f"Cannot read {args.file}: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_RUNTIME
+    report = repo.import_contacts(rows, campaign_id=args.campaign)
+    print(
+        f"Imported: {report.created} new, {report.updated} updated, "
+        f"{report.added_to_campaign} added to the campaign, {report.marked_dnc} marked do-not-call,"
+        f" {len(report.rejected)} rejected."
+    )
+    for line, error in report.rejected[:50]:
+        print(f"  line {line}: {error}")
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_contacts_list(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    rows = [
+        [
+            c["id"],
+            c["source"],
+            c["name"],
+            _phone(c["phone_e164"], args.unmask) or f"({c['phone_error']})",
+            "yes" if c["do_not_call"] else "",
+            c["campaigns"],
+            "missing in Notion" if c["missing_in_notion"] else "",
+        ]
+        for c in repo.list_contacts(campaign_id=args.campaign)
+    ]
+    _table(rows, ["id", "source", "name", "phone", "do-not-call", "campaigns", "note"])
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_jobs_list(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    rows = [
+        [
+            j["id"],
+            j["campaign_id"],
+            j["contact_name"],
+            _phone(j["phone"], args.unmask),
+            j["status"],
+            reason_label(j["reason"]),
+            j["attempts"],
+            "yes" if j["notion_page_id"] else "",
+        ]
+        for j in repo.list_jobs(campaign_id=args.campaign, status=args.status, limit=args.limit)
+    ]
+    _table(
+        rows, ["id", "campaign", "contact", "phone", "status", "reason", "attempts", "in Notion"]
+    )
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_dnc_add(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    added = repo.add_do_not_call(args.phone, reason=args.reason or "")
+    masked = mask_phone_numbers(args.phone)
+    print(f"{masked}: {'added to' if added else 'already on'} the do-not-call list.")
+    if settings.notion_enabled:
+        print("Notion contacts with this number get «Не звонить» on the next sync.")
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_dnc_remove(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    removed, remaining = repo.remove_do_not_call(args.phone, all_sources=args.all)
+    masked = mask_phone_numbers(args.phone)
+    print(f"{masked}: {removed} entr{'y' if removed == 1 else 'ies'} removed.")
+    if remaining:
+        print(
+            "Still blocked by: " + ", ".join(remaining) + ". A «Не звонить» mark in Notion is "
+            "removed in Notion; --all removes every local entry."
+        )
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_dnc_list(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    rows = [
+        [_phone(r["phone_e164"], args.unmask), r["source"], r["reason"], r["created_at"]]
+        for r in repo.list_do_not_call()
+    ]
+    _table(rows, ["phone", "source", "reason", "added (UTC)"])
+    return EXIT_OK
+
+
+@_with_repository
+def cmd_simulate(args: argparse.Namespace, settings: Settings, repo: Repository) -> int:
+    report = repo.simulate(campaign_id=args.campaign, limit=args.limit)
+    print(
+        f"Simulated {report.completed} call(s); no real call was placed. "
+        f"{report.skipped} job(s) skipped (not callable right now)."
+    )
+    if settings.notion_enabled:
+        print("Results reach Notion on the next sync (wewln notion sync, or wewln serve).")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------- parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,7 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the .env file (default: .env in the current folder; '' disables it)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    serve = sub.add_parser("serve", help="run the local HTTP API (/health, /ready)")
+    serve = sub.add_parser("serve", help="run the local HTTP API and the Notion sync")
     serve.add_argument("--host", help="override WEWLN_HTTP_HOST")
     serve.add_argument("--port", type=int, help="override WEWLN_HTTP_PORT")
     serve.set_defaults(func=cmd_serve)
@@ -161,10 +688,105 @@ def build_parser() -> argparse.ArgumentParser:
     check.set_defaults(func=cmd_check_config)
     init_db = sub.add_parser("init-db", help="create or upgrade the SQLite database")
     init_db.set_defaults(func=cmd_init_db)
+
+    notion = sub.add_parser("notion", help="Notion connection, databases and sync")
+    notion_sub = notion.add_subparsers(dest="notion_command", required=True)
+    token = notion_sub.add_parser("token", help="store the Notion token in the OS credential store")
+    token_sub = token.add_subparsers(dest="token_command", required=True)
+    token_set = token_sub.add_parser("set", help="save the token (asked without echo)")
+    token_set.add_argument("--stdin", action="store_true", help="read the token from stdin")
+    token_set.set_defaults(func=cmd_notion_token_set)
+    token_sub.add_parser("delete", help="remove the stored token").set_defaults(
+        func=cmd_notion_token_delete
+    )
+    token_sub.add_parser("status", help="where the token comes from (never shows it)").set_defaults(
+        func=cmd_notion_token_status
+    )
+    n_check = notion_sub.add_parser("check", help="check the token and the four databases")
+    n_check.add_argument("--repair", action="store_true", help="add missing properties and options")
+    n_check.set_defaults(func=cmd_notion_check)
+    n_boot = notion_sub.add_parser("bootstrap", help="create the four databases under a page")
+    n_boot.add_argument("--parent", required=True, help="link or ID of a page shared with wewln")
+    n_boot.add_argument(
+        "--write-env", action="store_true", help="save the database IDs to the .env file"
+    )
+    n_boot.set_defaults(func=cmd_notion_bootstrap)
+    notion_sub.add_parser("sync", help="run one sync cycle now").set_defaults(func=cmd_notion_sync)
+    n_status = notion_sub.add_parser("status", help="latest sync runs")
+    n_status.add_argument("--limit", type=int, default=10)
+    n_status.set_defaults(func=cmd_notion_status)
+    n_mock = notion_sub.add_parser("mock-server", help="run a local imitation of the Notion API")
+    n_mock.add_argument("--port", type=int, default=8799)
+    n_mock.add_argument("--demo", action="store_true", help="create databases and demo data")
+    n_mock.set_defaults(func=cmd_notion_mock_server)
+
+    campaign = sub.add_parser("campaign", help="local campaigns (Notion campaigns: in Notion)")
+    campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
+    c_create = campaign_sub.add_parser("create", help="create a local campaign (draft)")
+    c_create.add_argument("name")
+    c_create.add_argument("--script", help="conversation script text")
+    c_create.set_defaults(func=cmd_campaign_create)
+    campaign_sub.add_parser("list", help="all campaigns").set_defaults(func=cmd_campaign_list)
+    for name, status in (("start", CampaignStatus.RUNNING), ("pause", CampaignStatus.PAUSED)):
+        c_status = campaign_sub.add_parser(name, help=f"{name} a local campaign")
+        c_status.add_argument("campaign_id", type=int)
+        c_status.set_defaults(func=_campaign_status(status))
+    c_stop = campaign_sub.add_parser("stop", help="stop any campaign for good (works offline)")
+    c_stop.add_argument("campaign_id", type=int)
+    c_stop.add_argument("--reason", help="why it is stopped")
+    c_stop.set_defaults(func=cmd_campaign_stop)
+
+    contacts = sub.add_parser("contacts", help="local contacts")
+    contacts_sub = contacts.add_subparsers(dest="contacts_command", required=True)
+    k_import = contacts_sub.add_parser("import", help="import a CSV file (name, phone, dnc)")
+    k_import.add_argument("file")
+    k_import.add_argument("--campaign", type=int, help="add the contacts to this local campaign")
+    k_import.set_defaults(func=cmd_contacts_import)
+    k_list = contacts_sub.add_parser("list", help="contacts (phone numbers masked)")
+    k_list.add_argument("--campaign", type=int)
+    k_list.add_argument("--unmask", action="store_true", help="show full phone numbers")
+    k_list.set_defaults(func=cmd_contacts_list)
+
+    jobs = sub.add_parser("jobs", help="call jobs")
+    jobs_sub = jobs.add_subparsers(dest="jobs_command", required=True)
+    j_list = jobs_sub.add_parser("list", help="jobs with status and reason")
+    j_list.add_argument("--campaign", type=int)
+    j_list.add_argument(
+        "--status", choices=["queued", "blocked", "in_progress", "done", "failed", "cancelled"]
+    )
+    j_list.add_argument("--limit", type=int, default=500)
+    j_list.add_argument("--unmask", action="store_true", help="show full phone numbers")
+    j_list.set_defaults(func=cmd_jobs_list)
+
+    dnc = sub.add_parser("dnc", help="do-not-call list")
+    dnc_sub = dnc.add_subparsers(dest="dnc_command", required=True)
+    d_add = dnc_sub.add_parser("add", help="never call this number")
+    d_add.add_argument("phone")
+    d_add.add_argument("--reason")
+    d_add.set_defaults(func=cmd_dnc_add)
+    d_remove = dnc_sub.add_parser("remove", help="remove a manual entry")
+    d_remove.add_argument("phone")
+    d_remove.add_argument("--all", action="store_true", help="remove every local entry")
+    d_remove.set_defaults(func=cmd_dnc_remove)
+    d_list = dnc_sub.add_parser("list", help="the list (phone numbers masked)")
+    d_list.add_argument("--unmask", action="store_true", help="show full phone numbers")
+    d_list.set_defaults(func=cmd_dnc_list)
+
+    simulate = sub.add_parser("simulate", help="complete queued jobs with simulated calls")
+    simulate.add_argument("--campaign", type=int)
+    simulate.add_argument("--limit", type=int, default=10)
+    simulate.set_defaults(func=cmd_simulate)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     _utf8_stdio()
     args = build_parser().parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except WewlnError as exc:
+        print(f"Error: {exc.message}", file=sys.stderr)
+        return EXIT_RUNTIME
+    finally:
+        if args.func is not cmd_serve:
+            shutdown_logging()
