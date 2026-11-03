@@ -76,15 +76,24 @@ def setup_logging(
     fmt: str = "json",
     log_file: Path | None = None,
     secrets: Iterable[str] = (),
+    console: bool = True,
 ) -> None:
-    """Configure the root logger. Safe to call again: previous handlers of ours are replaced."""
+    """Configure the root logger. Safe to call again: previous handlers of ours are replaced.
+
+    `console=False` (one-shot CLI commands): log records go to the log file only, so that the
+    command's own output stays readable.
+    """
     shutdown_logging()
     secrets = tuple(secrets)
     root = logging.getLogger()
-    console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(JsonFormatter(secrets) if fmt == "json" else TextFormatter(secrets))
-    setattr(console, _OWN_HANDLER, True)
-    root.addHandler(console)
+    handler: logging.Handler
+    if console:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(JsonFormatter(secrets) if fmt == "json" else TextFormatter(secrets))
+    else:
+        handler = logging.NullHandler()  # keeps Python's last-resort stderr output away
+    setattr(handler, _OWN_HANDLER, True)
+    root.addHandler(handler)
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(

@@ -52,7 +52,7 @@ def test_check_detects_an_outdated_schema(tmp_path):
 def test_failed_migration_is_rolled_back(tmp_path):
     path = tmp_path / "wewln.db"
     broken = Migration(
-        version=2,
+        version=MIGRATIONS[-1].version + 1,
         name="broken",
         statements=("CREATE TABLE half_done (id INTEGER)", "THIS IS NOT SQL"),
     )
@@ -60,7 +60,7 @@ def test_failed_migration_is_rolled_back(tmp_path):
         Database(path, migrations=(*MIGRATIONS, broken)).migrate()
     db = Database(path)
     assert "half_done" not in table_names(db)
-    assert applied_versions(db) == [1]
+    assert applied_versions(db) == [m.version for m in MIGRATIONS]
     assert db.check()["status"] == "ok"
 
 
@@ -91,3 +91,26 @@ def test_audit_stores_phone_numbers_masked(tmp_path):
     # Nothing unmasked reaches the files on disk (database and WAL journal).
     for file in tmp_path.glob("wewln.db*"):
         assert b"1234567" not in file.read_bytes()
+
+
+def test_lock_is_exclusive_until_released_or_expired(tmp_path):
+    db = Database(tmp_path / "wewln.db")
+    db.migrate()
+    assert db.acquire_lock("sync", "a", ttl_seconds=60)
+    assert db.acquire_lock("sync", "a", ttl_seconds=60)  # renewal by the owner
+    assert not db.acquire_lock("sync", "b", ttl_seconds=60)
+    assert db.lock_holder("sync") == "a"
+    db.release_lock("sync", "a")
+    assert db.lock_holder("sync") is None
+    assert db.acquire_lock("sync", "b", ttl_seconds=-1)  # already expired
+    assert db.acquire_lock("sync", "a", ttl_seconds=60)
+
+
+def test_transaction_rolls_back_on_error(tmp_path):
+    db = Database(tmp_path / "wewln.db")
+    db.migrate()
+    with pytest.raises(RuntimeError), db.transaction() as conn:
+        conn.execute("INSERT INTO locks (name, owner, expires_at) VALUES ('x', 'y', 0)")
+        raise RuntimeError("boom")
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0] == 0

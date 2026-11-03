@@ -78,3 +78,64 @@ def test_server_process_answers_probes(tmp_path):
     if sys.platform != "win32":
         assert proc.returncode == 0
         assert actions[0] == "app.stop"
+
+
+def test_server_process_syncs_with_mock_notion(tmp_path):
+    """`serve` with Notion enabled: the background sync reaches the (mock) Notion API."""
+    import asyncio
+
+    from wewln_phonecaller.notion.mock_server import DEMO_PHONES, MockNotionServer, seed_demo
+
+    port = free_port()
+    data_dir = tmp_path / "data"
+    with MockNotionServer() as notion:
+        demo = asyncio.run(seed_demo(notion))
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("WEWLN_")}
+        env.update(dict(line.split("=", 1) for line in demo["env"]))
+        env.update(
+            WEWLN_DATA_DIR=str(data_dir),
+            WEWLN_HTTP_PORT=str(port),
+            WEWLN_NOTION_TOKEN=notion.mock.token,
+            WEWLN_NOTION_API_BASE_URL=notion.base_url,
+            WEWLN_NOTION_MAX_RPS="50",
+        )
+        output = tmp_path / "server-output.txt"
+        base = f"http://127.0.0.1:{port}"
+        with output.open("wb") as sink:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "wewln_phonecaller", "--env-file", "", "serve"],
+                cwd=tmp_path,
+                env=env,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                assert wait_for_health(proc, f"{base}/health") is not None, output.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                deadline = time.monotonic() + 30
+                notion_check = {}
+                while time.monotonic() < deadline:
+                    status, ready = get_json(f"{base}/ready")
+                    assert status == 200
+                    notion_check = ready["checks"]["notion"]
+                    if notion_check.get("status") != "starting" and not notion_check["running"]:
+                        break
+                    time.sleep(0.2)
+                assert notion_check["status"] == "ok", notion_check
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=15)
+        jobs = notion.mock.rows(notion.mock.data_source_by_title("Задания на звонки (wewln)"))
+        statuses = sorted(notion.mock.simple(page)["Статус"] for page in jobs)
+        assert statuses == ["В очереди", "Заблокировано", "Заблокировано"]
+        token = notion.mock.token
+
+    log_text = (data_dir / "logs" / "wewln.log").read_text(encoding="utf-8")
+    assert "notion_sync" in log_text
+    for secret in (token, *DEMO_PHONES, "491570156"):
+        assert secret not in log_text

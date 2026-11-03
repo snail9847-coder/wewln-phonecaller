@@ -109,15 +109,32 @@ def test_blank_token_means_unset(make_settings):
     assert make_settings(api_token="  ").api_token is None
 
 
+NOTION_DBS = {
+    "notion_campaigns_db": "11111111111111111111111111111111",
+    "notion_contacts_db": "22222222222222222222222222222222",
+    "notion_jobs_db": "33333333333333333333333333333333",
+    "notion_results_db": "44444444444444444444444444444444",
+}
+
+
+def test_notion_enabled_requires_databases(make_settings):
+    with pytest.raises(ConfigError) as exc:
+        make_settings(notion_enabled=True, notion_token="ntn_" + "x" * 40)
+    for env in ("CAMPAIGNS", "CONTACTS", "JOBS", "RESULTS"):
+        assert f"WEWLN_NOTION_{env}_DB" in problems(exc)
+
+
 def test_notion_enabled_requires_token(make_settings):
     with pytest.raises(ConfigError) as exc:
-        make_settings(notion_enabled=True)
+        make_settings(notion_enabled=True, **NOTION_DBS)
     assert "WEWLN_NOTION_TOKEN" in problems(exc)
+    assert "wewln notion token set" in problems(exc)
 
 
 def test_notion_enabled_with_token(make_settings):
-    s = make_settings(notion_enabled=True, notion_token="ntn_" + "x" * 40)
-    assert s.redacted_summary()["notion_token"] == "set"
+    s = make_settings(notion_enabled=True, notion_token="ntn_" + "x" * 40, **NOTION_DBS)
+    assert s.redacted_summary()["notion_token"] == "set (argument)"
+    assert s.notion_campaigns_db == "11111111-1111-1111-1111-111111111111"
 
 
 def test_unsupported_language_rejected(make_settings):
@@ -142,7 +159,7 @@ def test_several_problems_are_reported_together(make_settings):
     with pytest.raises(ConfigError) as exc:
         make_settings(mode="production", http_host="0.0.0.0", notion_enabled=True)
     text = problems(exc)
-    for name in ("WEWLN_PRODUCTION_CONFIRM", "WEWLN_API_TOKEN", "WEWLN_NOTION_TOKEN"):
+    for name in ("WEWLN_PRODUCTION_CONFIRM", "WEWLN_API_TOKEN", "WEWLN_NOTION_CAMPAIGNS_DB"):
         assert name in text
 
 
