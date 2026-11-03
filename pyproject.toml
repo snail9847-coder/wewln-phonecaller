@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wewln-phonecaller"
+version = "0.1.0"
+description = "Russian-language AI voice calling for Windows 10/11, optionally controlled from Notion; simulation-first."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.4,<3",
+  # Windows has no IANA time zone database; zoneinfo needs this package there.
+  "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "pytest-aiohttp>=1.1",
+  "pytest-asyncio>=0.24",
+  # Pinned to one minor version: newer ruff releases may change lint and format rules.
+  "ruff>=0.17.3,<0.18",
+]
+
+[project.scripts]
+wewln = "wewln_phonecaller.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S105", "S106", "S310", "S603"]

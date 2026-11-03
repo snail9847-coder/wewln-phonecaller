@@ -1,0 +1,40 @@
+# Secrets and local settings: never commit them
+.env
+.env.*
+!.env.example
+
+# Runtime data: database, logs, call recordings, downloaded models
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite3
+logs/
+*.log
+recordings/
+*.wav
+*.mp3
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+junit.xml
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
