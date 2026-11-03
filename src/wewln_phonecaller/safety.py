@@ -1,0 +1,72 @@
+"""The real-call gate: every condition must hold at once, otherwise calls stay simulated."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+
+from .config import PRODUCTION_CONFIRM_PHRASE, Settings
+from .errors import RealCallsBlockedError
+from .telephony import PROVIDERS, ProviderInfo
+
+
+class BlockReason(StrEnum):
+    SIMULATION_MODE = "simulation_mode"
+    PRODUCTION_NOT_CONFIRMED = "production_not_confirmed"
+    KILL_SWITCH = "kill_switch_engaged"
+    PROVIDER_UNKNOWN = "provider_unknown"
+    PROVIDER_SIMULATION_ONLY = "provider_simulation_only"
+    OPERATOR_NOT_ARMED = "operator_not_armed"
+
+
+@dataclass(frozen=True)
+class RealCallDecision:
+    allowed: bool
+    reasons: tuple[BlockReason, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {"allowed": self.allowed, "blocked_by": [r.value for r in self.reasons]}
+
+
+def evaluate_real_calls(
+    settings: Settings,
+    *,
+    operator_armed: bool = False,
+    providers: Mapping[str, ProviderInfo] = PROVIDERS,
+) -> RealCallDecision:
+    """Decide whether a real (non-simulated) call may be placed right now.
+
+    `operator_armed` comes from the explicit operator action added in Phase 6; nothing sets it
+    in this version, so real calls are always blocked.
+    """
+    reasons: list[BlockReason] = []
+    if settings.mode != "production":
+        reasons.append(BlockReason.SIMULATION_MODE)
+    elif settings.production_confirm != PRODUCTION_CONFIRM_PHRASE:
+        reasons.append(BlockReason.PRODUCTION_NOT_CONFIRMED)
+    if settings.kill_switch:
+        reasons.append(BlockReason.KILL_SWITCH)
+    provider = providers.get(settings.telephony_provider)
+    if provider is None:
+        reasons.append(BlockReason.PROVIDER_UNKNOWN)
+    elif not provider.places_real_calls:
+        reasons.append(BlockReason.PROVIDER_SIMULATION_ONLY)
+    if not operator_armed:
+        reasons.append(BlockReason.OPERATOR_NOT_ARMED)
+    return RealCallDecision(allowed=not reasons, reasons=tuple(reasons))
+
+
+def ensure_real_calls_allowed(
+    settings: Settings,
+    *,
+    operator_armed: bool = False,
+    providers: Mapping[str, ProviderInfo] = PROVIDERS,
+) -> None:
+    """Raise RealCallsBlockedError unless every condition for a real call holds."""
+    decision = evaluate_real_calls(settings, operator_armed=operator_armed, providers=providers)
+    if not decision.allowed:
+        raise RealCallsBlockedError(
+            "Real calls are blocked: " + ", ".join(r.value for r in decision.reasons),
+            details=decision.as_dict(),
+        )
