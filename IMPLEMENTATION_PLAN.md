@@ -355,8 +355,11 @@ pytest 9.2.0, ruff 0.17.3.
   25 files already formatted.
 - [x] Ручной смоук: `serve` → `/health` 200, `/ready` 200 (`real_calls.allowed=false`),
   `/api/v1/info` 401 `auth_not_configured`; SIGTERM → штатная остановка и `app.stop` в аудите.
-- [ ] CI в GitHub Actions на `ubuntu-latest` и `windows-latest` × Python 3.12–3.14 — результат
-  записывается сюда после прогона.
+- [x] CI в GitHub Actions: PR #1, запуск 41671270760 на коммите `22d3245` — все 6 задач `success`:
+  `ubuntu-latest` и `windows-latest` × Python 3.12, 3.13, 3.14 (установка, `ruff check`,
+  `ruff format --check`, `pytest`, `check-config`). Число тестов на CI видно в логах Actions.
+- [x] Поиск секретов перед публикацией: локальный поиск по шаблонам токенов и ключей — совпадений нет.
+  Secret scanning от GitHub для этого репозитория недоступен (нужен GitHub Advanced Security).
 - [x] Документация: README.md, docs/ARCHITECTURE.md, docs/CONFIGURATION.md, docs/TESTING.md,
   SECURITY.md; обновлён этот план.
 
@@ -440,4 +443,4 @@ pytest 9.2.0, ruff 0.17.3.
 - 2026-11-03 — Phase 1: аудит claude-phone (zip и GitHub), создан этот план.
 - 2026-11-03 — новые обязательные требования владельца (раздел 1.1): бесплатный стек, русский язык,
   реальные номера с честным разделением ПО и минут, проверка +7, Windows, Notion необязателен.
-- 2026-11-03 — Phase 2: фундамент backend (раздел 9).
+- 2026-11-03 — Phase 2: фундамент backend (раздел 9); PR #1, CI зелёный на Windows и Linux.
