@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -47,6 +48,48 @@ class Database:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction (BEGIN IMMEDIATE takes the write lock up front)."""
+        with self.connect(must_exist=True) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(f"database is busy ({type(exc).__name__})") from exc
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+
+    def acquire_lock(self, name: str, owner: str, ttl_seconds: float) -> bool:
+        """A lease shared by all processes using this database file. Expired leases are taken."""
+        now = time.time()
+        with self.transaction() as conn:
+            row = conn.execute("SELECT owner, expires_at FROM locks WHERE name = ?", (name,))
+            current = row.fetchone()
+            if current and current["owner"] != owner and current["expires_at"] > now:
+                return False
+            conn.execute(
+                "INSERT INTO locks (name, owner, expires_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (name) DO UPDATE SET owner = excluded.owner, "
+                "expires_at = excluded.expires_at",
+                (name, owner, now + ttl_seconds),
+            )
+        return True
+
+    def release_lock(self, name: str, owner: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM locks WHERE name = ? AND owner = ?", (name, owner))
+
+    def lock_holder(self, name: str) -> str | None:
+        with self.connect(must_exist=True) as conn:
+            row = conn.execute(
+                "SELECT owner FROM locks WHERE name = ? AND expires_at > ?", (name, time.time())
+            ).fetchone()
+        return row["owner"] if row else None
 
     @staticmethod
     def _version(conn: sqlite3.Connection) -> int:
@@ -115,18 +158,24 @@ class Database:
         subject: str | None = None,
         details: dict[str, Any] | None = None,
         request_id: str | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> int:
-        """Append to the audit trail. Phone numbers in subject and details are stored masked."""
+        """Append to the audit trail. Phone numbers in subject and details are stored masked.
+
+        Pass `conn` to write inside an open transaction of that connection.
+        """
         payload = json.dumps(redact_value(details or {}), ensure_ascii=False, sort_keys=True)
         masked_subject = redact(subject) if subject else None
+        sql = (
+            "INSERT INTO audit_log (ts, actor, action, subject, details, request_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        values = (_now(), actor, action, masked_subject, payload, request_id)
         try:
-            with self.connect() as conn:
-                cursor = conn.execute(
-                    "INSERT INTO audit_log (ts, actor, action, subject, details, request_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (_now(), actor, action, masked_subject, payload, request_id),
-                )
-                return int(cursor.lastrowid or 0)
+            if conn is not None:
+                return int(conn.execute(sql, values).lastrowid or 0)
+            with self.connect() as own:
+                return int(own.execute(sql, values).lastrowid or 0)
         except sqlite3.Error as exc:
             raise StorageError(f"audit write failed ({type(exc).__name__})") from exc
 
