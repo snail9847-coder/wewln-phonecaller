@@ -146,3 +146,15 @@ async def notion_world(notion_mock, notion_client_factory, make_settings, tmp_pa
     world = NotionWorld(notion_mock, workspace, make_settings, notion_client_factory, tmp_path)
     world.parent = parent
     return world
+
+
+@pytest.fixture
+async def ari_sim(aiohttp_server):
+    """An AriSimulator (imitation of Asterisk ARI) on 127.0.0.1; `sim.base_url` is its address."""
+    from ari_simulator import AriSimulator
+
+    sim = AriSimulator()
+    server = await aiohttp_server(sim.app())
+    sim.base_url = str(server.make_url("")).rstrip("/")
+    yield sim
+    await sim.close()
