@@ -62,6 +62,23 @@ class FailingMock(MockTelephonyProvider):
         raise self.error
 
 
+class SlowDialMock(MockTelephonyProvider):
+    """The dial request takes a while (as when Asterisk is slow to create the channel)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.sent = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def place_call(self, request):
+        self.sent.set()
+        await self.release.wait()
+        return await super().place_call(request)
+
+
+UNCERTAIN = ("dialing", "provider_uncertain")
+
+
 @pytest.fixture
 def world(make_settings):
     def build(*phones, scenario="answer", max_attempts=1, provider=None, start=True, **overrides):
@@ -316,6 +333,25 @@ async def test_emergency_stop_ends_calls_and_blocks_dialing(world):
     assert w.store.begin_job_attempt(provider="mock", simulated=True) is not None
 
 
+async def test_emergency_stop_during_the_dial_request_still_ends_the_call(world):
+    provider = SlowDialMock(scenario="silent", time_scale=0)
+    w = world(PHONE, max_attempts=2, provider=provider)
+    async with w.service:
+        task = asyncio.create_task(w.service.run_jobs())
+        await asyncio.wait_for(provider.sent.wait(), 5)
+        w.store.engage_kill_switch(source="test", reason="drill")
+        # The hangup is asked for while the provider does not know the call yet.
+        await until(lambda: [a["end_request"] for a in active(w)] == ["kill_switch"])
+        provider.release.set()
+        report = await asyncio.wait_for(task, 5)
+        (call,) = provider.placed
+        assert await provider.call_exists(call.call_id) is False
+    (outcome,) = report.outcomes
+    assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
+    assert provider.hangups == [call.call_id]
+    assert report.stopped_by == "kill_switch"
+
+
 async def test_kill_switch_setting_blocks_every_call(world):
     w = world(PHONE, kill_switch=True)
     async with w.service:
@@ -385,7 +421,7 @@ async def test_uncertain_request_is_watched_and_never_repeated(world):
     )
     async with w.service:
         task = asyncio.create_task(w.service.run_jobs())
-        await until(lambda: len(active(w)) == 1)
+        await until(lambda: [(a["state"], a["error_code"]) for a in active(w)] == [UNCERTAIN])
         w.clock.advance(w.settings.call_ring_timeout + 20)
         report = await asyncio.wait_for(task, 5)
     (outcome,) = report.outcomes

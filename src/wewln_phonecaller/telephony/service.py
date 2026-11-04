@@ -151,6 +151,8 @@ class CallService:
         self._started = False
         self._lock_lost = False
         self._lock_renewed = 0.0
+        # Attempts whose dial request is on its way: the provider may not know the call yet.
+        self._placing: set[int] = set()
 
     @property
     def simulated(self) -> bool:
@@ -287,6 +289,8 @@ class CallService:
                 if reason is not None:
                     await self._end(attempt, reason)
                 continue
+            if attempt["id"] in self._placing:
+                continue  # _place hangs up as soon as the dial request returns
             since = (now - parse_iso(attempt["hangup_requested_at"])).total_seconds()
             if since < HANGUP_RECHECK_S:
                 continue
@@ -331,6 +335,9 @@ class CallService:
             )
             return
         if not known:
+            if attempt["id"] in self._placing:
+                # The dial request may still create the call: _place ends it when it returns.
+                return
             fresh = await asyncio.to_thread(self.store.get_attempt, attempt["id"])
             if CallState(fresh["state"]) not in TERMINAL_STATES:
                 await asyncio.to_thread(self._finish_gone, fresh)
@@ -363,29 +370,47 @@ class CallService:
             caller_id=self.settings.caller_id,
             local_endpoint=ticket.local_endpoint,
         )
+        self._placing.add(ticket.attempt_id)
         try:
-            await self.provider.place_call(request)
-        except ProviderUncertainError as exc:
-            # The call may exist: it is watched like any other call and never repeated.
-            await asyncio.to_thread(self.store.mark_dialing, ticket.attempt_id, error_code=exc.code)
-            log.warning("call_place_uncertain", extra={"attempt_id": ticket.attempt_id})
-            return
-        except ProviderError as exc:
+            try:
+                await self.provider.place_call(request)
+            except ProviderUncertainError as exc:
+                # The call may exist: it is watched like any other call and never repeated.
+                error_code: str | None = exc.code
+            except ProviderError as exc:
+                await asyncio.to_thread(
+                    self.store.abandon_attempt,
+                    ticket.attempt_id,
+                    error_code=exc.code,
+                    job_reason=JobReason.PROVIDER_ERROR,
+                )
+                log.error(
+                    "call_place_failed", extra={"attempt_id": ticket.attempt_id, "error": exc.code}
+                )
+                raise
+            else:
+                error_code = None
             await asyncio.to_thread(
-                self.store.abandon_attempt,
-                ticket.attempt_id,
-                error_code=exc.code,
-                job_reason=JobReason.PROVIDER_ERROR,
+                self.store.mark_dialing, ticket.attempt_id, error_code=error_code
             )
-            log.error(
-                "call_place_failed", extra={"attempt_id": ticket.attempt_id, "error": exc.code}
+        finally:
+            self._placing.discard(ticket.attempt_id)
+        if error_code is not None:
+            log.warning("call_place_uncertain", extra={"attempt_id": ticket.attempt_id})
+        else:
+            log.info(
+                "call_placed",
+                extra={
+                    "attempt_id": ticket.attempt_id,
+                    "kind": ticket.kind,
+                    "target": ticket.target,
+                },
             )
-            raise
-        await asyncio.to_thread(self.store.mark_dialing, ticket.attempt_id)
-        log.info(
-            "call_placed",
-            extra={"attempt_id": ticket.attempt_id, "kind": ticket.kind, "target": ticket.target},
-        )
+        # An emergency stop or a cancel while the request was on its way may have found no call
+        # to hang up yet: end the call now that it may exist.
+        fresh = await asyncio.to_thread(self.store.get_attempt, ticket.attempt_id)
+        if fresh["end_request"] is not None and CallState(fresh["state"]) not in TERMINAL_STATES:
+            await self._end(fresh, fresh["end_request"])
 
     async def wait_for_end(self, attempt_id: int) -> CallOutcome:
         while True:
