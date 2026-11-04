@@ -16,7 +16,7 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,7 @@ from .storage import Database
 from .storage.calls import CallStore
 from .storage.repository import ContactInput, Repository
 from .telephony import PROVIDERS
+from .telephony.base import ProviderError
 from .telephony.factory import create_call_store, create_provider, create_repository
 from .telephony.lifecycle import STATE_LABELS, CallState
 from .telephony.service import CallOutcome, CallService
@@ -157,7 +158,18 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     blocked = ", ".join(r.value for r in decision.reasons)
     suffix = f" (blocked by: {blocked})" if blocked else ""
     print(f"  real_calls_allowed: {decision.allowed}{suffix}")
+    _print_call_path(settings)
+    for problem in settings.voice_problems:
+        print(f"warning: voice engine: {problem}", file=sys.stderr)
     return EXIT_OK
+
+
+def _print_call_path(settings: Settings, *, softphone: bool = False) -> None:
+    from .cli_voice import describe_call_path
+
+    print("Call path:")
+    for line in describe_call_path(settings, softphone=softphone):
+        print(f"  {line}")
 
 
 def cmd_init_db(args: argparse.Namespace) -> int:
@@ -770,8 +782,9 @@ def _calls_settings(args: argparse.Namespace, *, dialing: bool = False) -> Setti
     settings = _load(args.env_file)
     if settings is None:
         return None
-    if dialing and settings.provider_problems:
-        for problem in settings.provider_problems:
+    problems = [*settings.provider_problems, *settings.voice_problems] if dialing else []
+    if problems:
+        for problem in problems:
             print(f"Problem: {problem}", file=sys.stderr)
         return None
     _quiet_logging(settings)
@@ -788,10 +801,37 @@ def _service(args: argparse.Namespace, settings: Settings, store: CallStore) -> 
     scenario = getattr(args, "scenario", None)
     if scenario and settings.telephony_provider != "mock":
         raise WewlnError("--scenario works only with the mock provider", code="invalid_input")
+    voice = None
+    caller = None
+    if settings.voice_enabled:
+        from .voice.runtime import create_voice_runtime
+        from .voice.simulate import simulated_person
+
+        voice = create_voice_runtime(settings)
+        if settings.telephony_provider == "mock":
+            # A simulated person answers mock calls: the conversation really runs.
+            caller = simulated_person(voice.tts, frame_s=voice.config.frame_s)
     provider = create_provider(
-        settings, scenario=scenario, time_scale=0.0 if getattr(args, "fast", False) else 1.0
+        settings,
+        scenario=scenario,
+        time_scale=0.0 if getattr(args, "fast", False) else 1.0,
+        caller=caller,
     )
-    return CallService(settings, store, provider)
+    return CallService(settings, store, provider, voice=voice)
+
+
+@contextlib.asynccontextmanager
+async def _dialer(
+    args: argparse.Namespace, settings: Settings, store: CallStore
+) -> AsyncIterator[CallService]:
+    """The call service for one command; the voice engine (if on) is unloaded after it."""
+    service = _service(args, settings, store)
+    try:
+        async with service:
+            yield service
+    finally:
+        if service.voice is not None:
+            await service.voice.close()
 
 
 def _outcome_line(outcome: CallOutcome) -> str:
@@ -841,7 +881,7 @@ def cmd_calls_run(args: argparse.Namespace) -> int:
     store = _store(settings)
 
     async def run() -> Any:
-        async with _service(args, settings, store) as service:
+        async with _dialer(args, settings, store) as service:
             return await service.run_jobs(limit=args.limit, campaign_id=args.campaign)
 
     try:
@@ -853,6 +893,7 @@ def cmd_calls_run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             _precheck_real(settings, store, armed=False)
+        _print_call_path(settings)
         report = asyncio.run(run())
     except RealCallsBlockedError as exc:
         return _blocked(exc)
@@ -899,8 +940,8 @@ def cmd_calls_test(args: argparse.Namespace) -> int:
         except RealCallsBlockedError as exc:
             return _blocked(exc)
 
-    async def run() -> CallOutcome:
-        async with _service(args, settings, store) as service:
+    async def run() -> tuple[CallOutcome, Any]:
+        async with _dialer(args, settings, store) as service:
             if args.softphone:
                 print(
                     f"Test call to the local softphone {settings.asterisk_softphone_endpoint} "
@@ -909,16 +950,25 @@ def cmd_calls_test(args: argparse.Namespace) -> int:
             else:
                 kind = "simulated" if service.simulated else "REAL"
                 print(f"{kind} test call to {mask_phone_numbers(to or '')}...")
-            return await service.test_call(to_e164=to, softphone=args.softphone)
+            outcome = await service.test_call(to_e164=to, softphone=args.softphone)
+            return outcome, service.conversations.get(outcome.attempt_id)
 
+    _print_call_path(settings, softphone=args.softphone)
+    if settings.voice_enabled:
+        print("Loading the voice engine (the models stay loaded during the call)...")
     try:
-        outcome = asyncio.run(run())
+        outcome, conversation = asyncio.run(run())
     except RealCallsBlockedError as exc:
         return _blocked(exc)
     except KeyboardInterrupt:
         print("Interrupted: the call was ended; see `wewln calls list`.", file=sys.stderr)
         return 130
     print(_outcome_line(outcome))
+    if conversation is not None:
+        from .cli_voice import print_conversation
+
+        print_conversation(conversation)
+        print(f"Transcript later: wewln calls transcript {outcome.attempt_id}")
     return EXIT_OK
 
 
@@ -1220,6 +1270,10 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--campaign", type=int)
     simulate.add_argument("--limit", type=int, default=10)
     simulate.set_defaults(func=cmd_simulate)
+
+    from .cli_voice import register
+
+    register(sub, calls_sub)
     return parser
 
 
@@ -1230,6 +1284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.func(args))
     except WewlnError as exc:
         print(f"Error: {exc.message}", file=sys.stderr)
+        return EXIT_RUNTIME
+    except ProviderError as exc:
+        print(f"Telephony error ({exc.code}): {exc.message}", file=sys.stderr)
         return EXIT_RUNTIME
     finally:
         if args.func is not cmd_serve:

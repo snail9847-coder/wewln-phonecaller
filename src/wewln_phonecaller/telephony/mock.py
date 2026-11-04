@@ -8,6 +8,10 @@ Scenarios (times in seconds from the dial; `time_scale=0` makes them instant for
 - answer_hold: answered and never hung up (the maximum call duration must end it);
 - mixed: chosen by the last digit of the number (0-4 answer, 5-6 no_answer, 7 busy, 8 reject,
   9 fail), so a list of contacts produces a believable mix.
+
+With call audio enabled (voice mode) an answered call lasts until wewln hangs up or the
+simulated person (`caller`, e.g. voice.simulate.SimulatedCaller) hangs up; the scenario's own
+hangup is skipped. Without a `caller` the person stays silent on the line.
 """
 
 from __future__ import annotations
@@ -19,11 +23,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..voice.transport import MediaStream, memory_pair
 from . import PROVIDERS
 from .base import (
     CallRequest,
     EventKind,
     EventSink,
+    MediaError,
     PlaceCallResult,
     ProviderEvent,
     ProviderUnavailableError,
@@ -31,6 +37,15 @@ from .base import (
 )
 
 RING_TIMEOUT_STEP = -1.0  # placeholder delay: "at the request's ring timeout"
+# The simulated person on an answered call: gets the phone's end of the audio and returns when
+# they hang up.
+MockCaller = Callable[[CallRequest, MediaStream], Awaitable[None]]
+
+
+async def silent_caller(request: CallRequest, phone: MediaStream) -> None:
+    """Picks up and says nothing until the call ends."""
+    while await phone.read() is not None:
+        pass
 
 
 @dataclass(frozen=True)
@@ -85,6 +100,7 @@ def scenario_for(name: str, number: str) -> str:
 
 class MockTelephonyProvider(TelephonyProvider):
     info = PROVIDERS["mock"]
+    supports_media = True
 
     def __init__(
         self,
@@ -93,8 +109,12 @@ class MockTelephonyProvider(TelephonyProvider):
         time_scale: float = 1.0,
         duplicate_events: bool = False,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        caller: MockCaller | None = None,
     ) -> None:
         self._scenario = scenario
+        self._caller = caller
+        self._phones: dict[str, tuple[MediaStream, asyncio.Task[None]]] = {}
+        self._requests: dict[str, CallRequest] = {}
         self._scale = max(0.0, time_scale)
         self._duplicates = duplicate_events
         self._sleep = sleep
@@ -109,6 +129,8 @@ class MockTelephonyProvider(TelephonyProvider):
         self._sink = sink
 
     async def close(self) -> None:
+        for call_id in list(self._phones):
+            await self._drop_phone(call_id)
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
@@ -128,6 +150,7 @@ class MockTelephonyProvider(TelephonyProvider):
         if request.call_id in self._tasks or any(r.call_id == request.call_id for r in self.placed):
             return PlaceCallResult(request.call_id, already_existed=True)
         self.placed.append(request)
+        self._requests[request.call_id] = request
         steps = SCENARIOS[self.scenario_name(request)]
         self._tasks[request.call_id] = asyncio.create_task(self._run(request, steps))
         return PlaceCallResult(request.call_id)
@@ -144,6 +167,8 @@ class MockTelephonyProvider(TelephonyProvider):
                 await self._emit(request.call_id, step)
                 if step.kind == EventKind.HANGUP:
                     return
+                if step.kind == EventKind.ANSWERED and self.media_enabled:
+                    break  # the conversation decides when the call ends
             # No hangup in the scenario (silent, answer_hold): the call lasts until hung up.
             await asyncio.Event().wait()
         finally:
@@ -174,9 +199,55 @@ class MockTelephonyProvider(TelephonyProvider):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        await self._drop_phone(call_id)
         # As a PBX does: the hangup we asked for comes back as an event.
         await self._emit(call_id, MockStep(0, EventKind.HANGUP, 16, "Normal Clearing"))
         return True
+
+    async def open_media(self, call_id: str) -> MediaStream:
+        if not self.media_enabled:
+            raise MediaError("call audio is not enabled")
+        if call_id not in self._tasks or call_id not in self._answered:
+            raise MediaError("the call is not answered (or already over)")
+        if call_id in self._phones:
+            raise MediaError("the call's audio is already connected")
+        line, phone = memory_pair()
+        request = self._requests[call_id]
+        task = asyncio.create_task(self._person(call_id, request, line, phone))
+        self._phones[call_id] = (line, task)
+        return line
+
+    async def _person(
+        self, call_id: str, request: CallRequest, line: MediaStream, phone: MediaStream
+    ) -> None:
+        try:
+            await (self._caller or silent_caller)(request, phone)
+        finally:
+            # wewln closed the audio (the call itself ends when wewln hangs up), or not.
+            by_wewln = bool(getattr(line, "closed_here", False))
+            await phone.close()
+        if by_wewln:
+            return
+        # The person hung up: the call ends, reported like any other hangup.
+        call = self._tasks.pop(call_id, None)
+        if call is None:
+            return
+        call.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await call
+        self._phones.pop(call_id, None)
+        await self._emit(call_id, MockStep(0, EventKind.HANGUP, 16, "Normal Clearing"))
+
+    async def _drop_phone(self, call_id: str) -> None:
+        entry = self._phones.pop(call_id, None)
+        if entry is None:
+            return
+        line, person = entry
+        await line.close()
+        if person is not asyncio.current_task():
+            person.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await person
 
     async def call_exists(self, call_id: str) -> bool | None:
         return call_id in self._tasks

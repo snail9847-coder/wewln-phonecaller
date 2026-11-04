@@ -3,7 +3,14 @@
 It behaves like Asterisk where wewln depends on it: Basic auth, `POST /channels/{id}` with 409
 for an existing ID, `DELETE` / `GET` channels, playback, and the event stream of a Stasis
 application (ChannelStateChange, StasisStart, ChannelDestroyed, PlaybackFinished). What a call
-does is a scenario chosen per dialed endpoint. No SIP, no audio.
+does is a scenario chosen per dialed endpoint. No SIP.
+
+Call audio as in Asterisk 20-22: mixing bridges, `POST /channels/externalMedia` with the
+AudioSocket encapsulation really connects over TCP to the given host:port and sends the UUID
+first (as chan_audiosocket does, during the request), and `GET /asterisk/modules/{name}`.
+Once a call and its audio channel are bridged, `media_person` is the person on the line.
+`drop_media` hangs up an audio channel while its call stays up, as Asterisk 22.5 sometimes
+does; the person stays on the line and hears wewln again once a new audio channel joins.
 """
 
 from __future__ import annotations
@@ -12,11 +19,15 @@ import asyncio
 import base64
 import contextlib
 import itertools
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from aiohttp import WSMsgType, web
+
+from wewln_phonecaller.voice.transport import AudioSocketConnection, MediaStream, uuid_message
 
 # (delay in seconds, event) steps; "answer" waits for the provider's playback/hangup.
 SCENARIOS: dict[str, tuple[tuple[float, str, dict[str, Any]], ...]] = {
@@ -57,6 +68,48 @@ class Channel:
     task: asyncio.Task[None] | None = None
 
 
+class PersonLine(MediaStream):
+    """The person's end of a call's audio. It outlives the audio channel: after drop_media the
+    person waits on the same line until wewln's new audio channel joins the bridge."""
+
+    def __init__(self, connection: AudioSocketConnection) -> None:
+        self.connection = connection
+        self._changed = asyncio.Event()
+        self._ended = False
+        self.closed_here = False  # the person hung up
+
+    @property
+    def closed(self) -> bool:
+        return self._ended or self.closed_here
+
+    def switch(self, connection: AudioSocketConnection) -> None:
+        self.connection = connection
+        self._changed.set()
+
+    def end(self) -> None:
+        self._ended = True
+        self._changed.set()
+
+    async def read(self) -> bytes | None:
+        while True:
+            connection = self.connection
+            chunk = await connection.read()
+            if chunk is not None:
+                return chunk
+            while self.connection is connection and not self.closed:
+                self._changed.clear()
+                await self._changed.wait()
+            if self.closed:
+                return None
+
+    async def write(self, pcm: bytes) -> None:
+        await self.connection.write(pcm)  # lost while there is no audio channel
+
+    async def close(self) -> None:
+        self.closed_here = True
+        await self.connection.close()
+
+
 @dataclass
 class AriSimulator:
     username: str = "wewln"
@@ -73,6 +126,15 @@ class AriSimulator:
     post_delay: float = 2.0
     # "normal" or "error": GET /channels/{id} answers HTTP 500 (existence cannot be told)
     get_behavior: str = "normal"
+    modules: set[str] = field(
+        default_factory=lambda: {"chan_audiosocket.so", "res_audiosocket.so", "bridge_simple.so"}
+    )
+    # "normal"; "refuse": externalMedia fails with HTTP 500 (as when the AudioSocket connection
+    # cannot be made); "no_stasis": the audio channel never enters the application
+    media_behavior: str = "normal"
+    # The person on an answered call's line (Asterisk's end of the AudioSocket connection).
+    # When it returns after closing the line itself, the person has hung up. Default: silence.
+    media_person: Callable[[MediaStream], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         self.channels: dict[str, Channel] = {}
@@ -80,8 +142,15 @@ class AriSimulator:
         self.sockets: dict[str, web.WebSocketResponse] = {}
         self.ws_connects = 0
         self._seq = itertools.count(1)
-        self._background: set[asyncio.Future[Channel]] = set()
+        self._background: set[asyncio.Future[Any]] = set()
         self.base_url = ""
+        self.bridges: dict[str, list[str]] = {}
+        self.media: dict[str, AudioSocketConnection] = {}
+        self.media_connects = 0
+        self.persons: dict[str, asyncio.Task[None]] = {}
+        self.lines: dict[str, PersonLine] = {}
+        self.media_drops = 0
+        self._dropping: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
 
@@ -108,6 +177,15 @@ class AriSimulator:
     async def _destroy(self, channel: Channel, cause: int, cause_txt: str, tech: int | None):
         if self.channels.pop(channel.id, None) is None:
             return
+        for bridge_id, members in self.bridges.items():
+            if channel.id in members:
+                members.remove(channel.id)
+                person = self.lines.get(bridge_id)
+                if person is not None and channel.id not in self._dropping:
+                    person.end()
+        line = self.media.pop(channel.id, None)
+        if line is not None:
+            await line.close()
         event: dict[str, Any] = {
             "type": "ChannelDestroyed",
             "cause": cause,
@@ -305,11 +383,132 @@ class AriSimulator:
             del self.sockets[app]
         return ws
 
+    # ------------------------------------------------------------------ call audio
+
+    async def module(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        if name not in self.modules:
+            return web.json_response(
+                {"message": "Module could not be found in running modules"}, status=404
+            )
+        return web.json_response(
+            {"name": name, "description": name, "use_count": 0, "status": "Running"}
+        )
+
+    async def external_media(self, request: web.Request) -> web.Response:
+        query = request.query
+        app = query.get("app", "")
+        host = query.get("external_host", "")
+        if not app or not host or not query.get("format"):
+            return web.json_response({"message": "Invalid parameters"}, status=400)
+        if query.get("encapsulation") != "audiosocket" or query.get("transport") != "tcp":
+            return web.json_response({"message": "Not simulated"}, status=501)
+        try:
+            call_uuid = str(uuid.UUID(query.get("data", "")))
+        except ValueError:
+            return web.json_response(
+                {"message": "AudioSocket requires a UUID in the data parameter"}, status=400
+            )
+        channel_id = query.get("channelId") or f"1730000000.{next(self._seq)}"
+        if channel_id in self.channels:
+            return web.json_response(
+                {"message": "Channel with given unique ID already exists"}, status=409
+            )
+        if self.media_behavior == "refuse" or "chan_audiosocket.so" not in self.modules:
+            return web.json_response({"message": "Internal Server Error"}, status=500)
+        address, _, port = host.rpartition(":")
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(address.strip("[]"), int(port)), 2.0
+            )
+        except (OSError, ValueError, TimeoutError):
+            return web.json_response({"message": "Internal Server Error"}, status=500)
+        writer.write(uuid_message(call_uuid))
+        await writer.drain()
+        self.media_connects += 1
+        channel = Channel(id=channel_id, endpoint=f"AudioSocket/{host}", app=app, state="Up")
+        self.channels[channel_id] = channel
+        self.media[channel_id] = AudioSocketConnection(reader, writer, call_uuid)
+        if self.media_behavior != "no_stasis":
+            channel.task = asyncio.create_task(self._enter_stasis(channel))
+        return web.json_response(self._channel_json(channel))
+
+    async def _enter_stasis(self, channel: Channel) -> None:
+        await asyncio.sleep(0.005)
+        if channel.id in self.channels:
+            await self.send(
+                channel.app,
+                {"type": "StasisStart", "args": [], "channel": self._channel_json(channel)},
+            )
+
+    async def create_bridge(self, request: web.Request) -> web.Response:
+        bridge_id = request.match_info["id"]
+        members = self.bridges.setdefault(bridge_id, [])
+        return web.json_response(
+            {
+                "id": bridge_id,
+                "bridge_type": request.query.get("type", "mixing"),
+                "channels": members,
+            }
+        )
+
+    async def add_to_bridge(self, request: web.Request) -> web.Response:
+        bridge_id = request.match_info["id"]
+        members = self.bridges.get(bridge_id)
+        if members is None:
+            return web.json_response({"message": "Bridge not found"}, status=404)
+        names = [n for n in request.query.get("channel", "").split(",") if n]
+        if not names or any(n not in self.channels for n in names):
+            return web.json_response({"message": "Channel not found"}, status=400)
+        members.extend(n for n in names if n not in members)
+        lines = [m for m in members if m in self.media]
+        calls = [m for m in members if m not in self.media]
+        if lines and calls and bridge_id not in self.persons:
+            person = PersonLine(self.media[lines[0]])
+            self.lines[bridge_id] = person
+            task = asyncio.create_task(self._person(person, self.channels[calls[0]]))
+            self.persons[bridge_id] = task
+        elif lines and bridge_id in self.lines:
+            self.lines[bridge_id].switch(self.media[lines[-1]])  # a new audio channel
+        return web.Response(status=204)
+
+    async def drop_media(self, channel_id: str) -> None:
+        """The audio channel hangs up on its own and closes its connection; the call stays."""
+        channel = self.channels[channel_id]
+        self._dropping.add(channel_id)
+        try:
+            self.media_drops += 1
+            await self._destroy(channel, 16, "Normal Clearing", None)
+        finally:
+            self._dropping.discard(channel_id)
+
+    async def delete_bridge(self, request: web.Request) -> web.Response:
+        if self.bridges.pop(request.match_info["id"], None) is None:
+            return web.json_response({"message": "Bridge not found"}, status=404)
+        return web.Response(status=204)
+
+    async def _person(self, line: PersonLine, call: Channel) -> None:
+        if self.media_person is None:
+            while await line.read() is not None:
+                pass
+            return
+        await self.media_person(line)
+        if line.closed_here and call.id in self.channels:
+            # The person hung up (wewln did not end the call first).
+            if call.task is not None:
+                call.task.cancel()
+            await self._destroy(call, 16, "Normal Clearing", None)
+
     def app(self) -> web.Application:
         application = web.Application(middlewares=[self._auth])
         application.router.add_get("/ari/asterisk/info", self.info)
+        application.router.add_get("/ari/asterisk/modules/{name}", self.module)
         application.router.add_get("/ari/applications/{name}", self.application)
         application.router.add_get("/ari/endpoints/{tech}/{resource}", self.endpoint)
+        application.router.add_post("/ari/channels/externalMedia", self.external_media)
+        application.router.add_post("/ari/bridges/{id}", self.create_bridge)
+        application.router.add_post("/ari/bridges/{id}/addChannel", self.add_to_bridge)
+        application.router.add_delete("/ari/bridges/{id}", self.delete_bridge)
         application.router.add_post("/ari/channels/{id}", self.create_channel)
         application.router.add_get("/ari/channels/{id}", self.get_channel)
         application.router.add_delete("/ari/channels/{id}", self.delete_channel)
@@ -318,9 +517,12 @@ class AriSimulator:
         return application
 
     async def close(self) -> None:
-        for task in list(self._background):
+        for task in [*self._background, *self.persons.values()]:
             task.cancel()
         for channel in list(self.channels.values()):
             if channel.task is not None:
                 channel.task.cancel()
+        for line in list(self.media.values()):
+            await line.close()
+        self.media.clear()
         await self.drop_websockets()

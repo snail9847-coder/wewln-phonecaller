@@ -8,6 +8,11 @@ Only one dialer runs at a time (a lease in SQLite shared by all processes). The 
 - after a crash first settles calls that may still exist, before it dials anything new;
 - ends a call the provider reports alive although wewln already counts it as ended.
 
+With the voice engine (WEWLN_VOICE_MODE=ai) an answered call gets a spoken conversation: the
+service connects the call's audio, runs the conversation, stores the transcript, records a
+request not to be called again (do-not-call list, real calls only) and ends the call when the
+conversation is over.
+
 In this version real calls are possible only as a single test call to one number with the
 operator's permit (`wewln calls permit`), or to a local softphone (no phone network at all).
 Campaign calls over a real provider stay blocked until campaigns can be armed (Phase 6).
@@ -22,34 +27,43 @@ import os
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from ..config import Settings
-from ..domain import JobReason
+from ..domain import JobReason, SuppressionSource
 from ..errors import RealCallsBlockedError, WewlnError
 from ..phones import describe_number, dial_policy_problem
 from ..safety import evaluate_real_calls
 from ..storage.calls import CallStore, DialTicket, KillSwitchEngagedError, parse_iso
 from ..storage.repository import InvalidInputError
+from ..voice.engine import SessionResult, Turn
+from ..voice.timing import fine_timer
 from .base import (
     CallRequest,
+    EventKind,
     ProviderError,
     ProviderEvent,
     ProviderUncertainError,
     TelephonyProvider,
 )
 from .lifecycle import (
+    CALLER_HANGUP,
     HANGUP_UNCONFIRMED,
     INTERRUPTED,
     KILL_SWITCH,
     MAX_DURATION,
+    MEDIA_LOST,
     REAL_CALLS_BLOCKED,
     RING_TIMEOUT,
     STATE_LOST,
     TERMINAL_STATES,
+    VOICE_ERROR,
     CallState,
 )
+
+if TYPE_CHECKING:
+    from ..voice.runtime import VoiceRuntime
 
 log = logging.getLogger("wewln.calls")
 
@@ -67,6 +81,11 @@ MAX_HANGUP_TRIES = 5
 PLACE_SETTLE_S = 12.0
 # How long start() waits for the calls it ends after a crash, before anything new is dialed.
 RECOVER_WAIT_S = 5.0
+# The conversation's audio ended (the person hung up): how long to wait for the provider's
+# hangup event before wewln ends the call itself.
+MEDIA_END_GRACE_S = 3.0
+# How long a finished call waits for its conversation to store its result.
+CONVERSATION_SETTLE_S = 10.0
 
 
 class DialerBusyError(WewlnError):
@@ -85,6 +104,9 @@ class CallOutcome:
     tech_cause: int | None = None
     error_code: str | None = None
     job_id: int | None = None
+    voice_end: str | None = None
+    opt_out: bool = False
+    voice_turns: int | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> CallOutcome:
@@ -98,6 +120,9 @@ class CallOutcome:
             tech_cause=row["tech_cause"],
             error_code=row["error_code"],
             job_id=row["job_id"],
+            voice_end=row.get("voice_end"),
+            opt_out=bool(row.get("opt_out")),
+            voice_turns=row.get("voice_turns"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -111,6 +136,9 @@ class CallOutcome:
             "tech_cause": self.tech_cause,
             "error_code": self.error_code,
             "job_id": self.job_id,
+            "voice_end": self.voice_end,
+            "opt_out": self.opt_out,
+            "voice_turns": self.voice_turns,
         }
 
 
@@ -146,6 +174,7 @@ class CallService:
         ring_grace_s: float = RING_GRACE_S,
         place_settle_s: float = PLACE_SETTLE_S,
         campaign_armed: Callable[[], bool] | None = None,
+        voice: VoiceRuntime | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -166,6 +195,13 @@ class CallService:
         # Hangups of calls that were reported alive after they ended in wewln.
         self._late_hangups: set[asyncio.Task[None]] = set()
         self._stuck_reported: set[int] = set()
+        # The voice engine: a conversation per answered call (by provider call ID).
+        self.voice = voice
+        self._conversations: dict[str, asyncio.Task[None]] = {}
+        # Numbers of live voice calls, for a request not to be called again (never logged).
+        self._numbers: dict[str, str] = {}
+        self.conversations: dict[int, SessionResult] = {}
+        self._timer: contextlib.ExitStack | None = None
 
     @property
     def simulated(self) -> bool:
@@ -174,6 +210,10 @@ class CallService:
     # ------------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
+        if self.voice is not None:
+            # Before anything is dialed: the models are loaded and the call audio is set up.
+            self.provider.enable_media()
+            await self.voice.start()
         db = self.store.db
         if not await asyncio.to_thread(db.acquire_lock, DIALER_LOCK, self.owner, LOCK_TTL_S):
             holder = await asyncio.to_thread(db.lock_holder, DIALER_LOCK)
@@ -183,16 +223,35 @@ class CallService:
             await self.provider.start(self._on_event)
             await self.recover()
             await asyncio.to_thread(self.store.prune_events)
+            if self.voice is not None:
+                await asyncio.to_thread(
+                    self.store.prune_turns, days=self.settings.voice_transcript_days
+                )
         except BaseException:
             with contextlib.suppress(Exception):
                 await self.provider.close()
             await asyncio.to_thread(db.release_lock, DIALER_LOCK, self.owner)
             raise
         self._started = True
+        if self.voice is not None:
+            self._timer = contextlib.ExitStack()
+            self._timer.enter_context(fine_timer())
         self._sweeper = asyncio.create_task(self._sweep_loop())
-        log.info("dialer_started", extra={"provider": self.provider.info.name})
+        log.info(
+            "dialer_started",
+            extra={"provider": self.provider.info.name, "voice": self.voice is not None},
+        )
 
     async def close(self) -> None:
+        if self._conversations:
+            # Shutdown: a conversation in progress ends its call.
+            tasks = set(self._conversations.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.wait(tasks, timeout=HANGUP_RECHECK_S)
+        if self._timer is not None:
+            self._timer.close()
+            self._timer = None
         if self._sweeper is not None:
             self._sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -225,6 +284,15 @@ class CallService:
             extra={"kind": event.kind.value, "outcome": outcome, "source": event.source},
         )
         self._changed.set()
+        if (
+            outcome == "applied"
+            and event.kind == EventKind.ANSWERED
+            and self.voice is not None
+            and event.call_id not in self._conversations
+        ):
+            task = asyncio.create_task(self._converse(event.call_id))
+            self._conversations[event.call_id] = task
+            task.add_done_callback(lambda _t, cid=event.call_id: self._conversations.pop(cid, None))
         if outcome == "after_end":
             # Progress on a call that ended in wewln without the provider reporting its end: it
             # must not live on. Decided when the event was applied (a repeated ringing signal
@@ -248,6 +316,128 @@ class CallService:
 
     def kill_switch_engaged(self) -> bool:
         return self.settings.kill_switch or self.store.kill_switch() is not None
+
+    # ------------------------------------------------------------------ conversations
+
+    async def _converse(self, call_id: str) -> None:
+        """Talk with the person on an answered call, then end the call (unless they did)."""
+        attempt = await asyncio.to_thread(self.store.find_attempt, call_id)
+        if attempt is None or self.voice is None:
+            return
+        attempt_id = attempt["id"]
+        extra = {"attempt_id": attempt_id}
+        try:
+            try:
+                result = await self._talk(call_id, attempt_id)
+            except asyncio.CancelledError:
+                # Shutdown: the call must not live on without anyone talking.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(self._end_if_active(attempt_id, INTERRUPTED))
+                raise
+            except Exception:
+                log.exception("voice_conversation_failed", extra=extra)
+                result = SessionResult(
+                    VOICE_ERROR, hangup=True, opt_out=False, turns=[], error="internal_error"
+                )
+            self.conversations[attempt_id] = result
+            voice_end = result.reason
+            if voice_end == CALLER_HANGUP:
+                fresh = await asyncio.to_thread(self.store.get_attempt, attempt_id)
+                # The audio ended because wewln ended the call (time limit, emergency stop).
+                voice_end = fresh["end_request"] or voice_end
+            log.info(
+                "voice_conversation_ended",
+                extra={
+                    **extra,
+                    "reason": voice_end,
+                    "caller_turns": result.caller_turns,
+                    "opt_out": result.opt_out,
+                    "error": result.error,
+                },
+            )
+            try:
+                await asyncio.to_thread(
+                    self.store.record_conversation,
+                    attempt_id,
+                    voice_end=voice_end,
+                    opt_out=result.opt_out,
+                    caller_turns=result.caller_turns,
+                )
+                if result.opt_out:
+                    await self._record_opt_out(attempt_id, call_id)
+            except Exception:
+                log.exception("voice_result_not_saved", extra=extra)
+            if result.hangup:
+                await self._end_if_active(attempt_id, result.reason)
+            else:
+                await self._settle_after_media_end(attempt_id)
+        finally:
+            self._numbers.pop(call_id, None)
+            self._changed.set()
+
+    async def _talk(self, call_id: str, attempt_id: int) -> SessionResult:
+        assert self.voice is not None  # noqa: S101 - checked by _converse
+        script = await asyncio.to_thread(self.store.conversation_script, attempt_id)
+        try:
+            media = await self.provider.open_media(call_id)
+        except ProviderError as exc:
+            log.error(
+                "voice_media_failed",
+                extra={"attempt_id": attempt_id, "error": exc.code, "detail": exc.message},
+            )
+            return SessionResult(VOICE_ERROR, hangup=True, opt_out=False, turns=[], error=exc.code)
+        log.info("voice_conversation_started", extra={"attempt_id": attempt_id})
+        session = self.voice.session(
+            media,
+            script=script,
+            on_turn=self._turn_sink(attempt_id),
+            label=f"attempt:{attempt_id}",
+        )
+        return await session.run()
+
+    def _turn_sink(self, attempt_id: int) -> Callable[[Turn], Any]:
+        async def store_turn(turn: Turn) -> None:
+            if self.settings.voice_store_transcripts:
+                await asyncio.to_thread(self.store.add_turn, attempt_id, asdict(turn))
+
+        return store_turn
+
+    async def _record_opt_out(self, attempt_id: int, call_id: str) -> None:
+        """The person asked not to be called again: their number goes on the do-not-call list.
+        Not for simulated calls (nobody real asked) and not for a softphone (no number)."""
+        attempt = await asyncio.to_thread(self.store.get_attempt, attempt_id)
+        number = self._numbers.get(call_id)
+        if attempt["simulated"] or not number:
+            log.info("voice_opt_out_not_listed", extra={"attempt_id": attempt_id})
+            return
+        await asyncio.to_thread(
+            self.store.repo.add_do_not_call,
+            number,
+            reason=f"asked not to be called again (call {attempt_id})",
+            source=SuppressionSource.OPT_OUT,
+        )
+        log.warning("voice_opt_out_listed", extra={"attempt_id": attempt_id})
+
+    async def _end_if_active(self, attempt_id: int, reason: str) -> None:
+        fresh = await asyncio.to_thread(self.store.get_attempt, attempt_id)
+        if CallState(fresh["state"]) not in TERMINAL_STATES:
+            await self._end(fresh, reason)
+
+    async def _settle_after_media_end(self, attempt_id: int) -> None:
+        """The call's audio ended without wewln ending the call: normally the person hung up
+        and the provider reports it. Otherwise the audio was lost: the call is ended."""
+        deadline = time.monotonic() + MEDIA_END_GRACE_S
+        while time.monotonic() < deadline:
+            fresh = await asyncio.to_thread(self.store.get_attempt, attempt_id)
+            if CallState(fresh["state"]) in TERMINAL_STATES or fresh["end_request"]:
+                return
+            await asyncio.sleep(0.1)
+        await self._end_if_active(attempt_id, MEDIA_LOST)
+
+    async def _conversation_done(self, call_id: str) -> None:
+        task = self._conversations.get(call_id)
+        if task is not None:
+            await asyncio.wait({task}, timeout=CONVERSATION_SETTLE_S)
 
     # ------------------------------------------------------------------ recovery and sweeping
 
@@ -454,6 +644,8 @@ class CallService:
             caller_id=self.settings.caller_id,
             local_endpoint=ticket.local_endpoint,
         )
+        if self.voice is not None and ticket.target == "phone" and ticket.to_e164:
+            self._numbers[ticket.call_id] = ticket.to_e164
         self._placing.add(ticket.attempt_id)
         try:
             try:
@@ -567,7 +759,12 @@ class CallService:
     async def _call(self, ticket: DialTicket) -> CallOutcome:
         try:
             await self._place(ticket)
-            return await self.wait_for_end(ticket.attempt_id)
+            outcome = await self.wait_for_end(ticket.attempt_id)
+            if ticket.call_id in self._conversations:
+                # The conversation stores how it ended (and the transcript) just after.
+                await self._conversation_done(ticket.call_id)
+                outcome = await self.wait_for_end(ticket.attempt_id)
+            return outcome
         except (ProviderError, RealCallsBlockedError):
             raise  # nothing was dialed (see _place)
         except BaseException:
@@ -576,6 +773,9 @@ class CallService:
             with contextlib.suppress(Exception):
                 await asyncio.shield(self.hangup_all(INTERRUPTED))
             raise
+        finally:
+            if ticket.call_id not in self._conversations:
+                self._numbers.pop(ticket.call_id, None)
 
     def _real_gate(self, *, operator_armed: bool) -> None:
         decision = evaluate_real_calls(

@@ -2,6 +2,7 @@ import pytest
 
 from wewln_phonecaller import __version__
 from wewln_phonecaller.cli import main
+from wewln_phonecaller.storage.migrations import MIGRATIONS
 
 TOKEN = "z" * 40
 NOTION_DB_ENV = {
@@ -66,7 +67,7 @@ def test_init_db_is_idempotent(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("WEWLN_DATA_DIR", str(tmp_path / "d"))
     assert main(["init-db"]) == 0
     assert main(["init-db"]) == 0
-    assert "(schema version 3)" in capsys.readouterr().out
+    assert f"(schema version {MIGRATIONS[-1].version})" in capsys.readouterr().out
     assert (tmp_path / "d" / "wewln.db").is_file()
 
 
