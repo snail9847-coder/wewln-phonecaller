@@ -1,10 +1,12 @@
 """The call service: dials attempts through a provider and keeps every call accounted for.
 
 Only one dialer runs at a time (a lease in SQLite shared by all processes). The service
-- re-checks everything at dial time (CallStore.begin_*) and only then asks the provider to dial;
+- re-checks everything when it writes the attempt (CallStore.begin_*) and once more right before
+  the dial request, and only then asks the provider to dial;
 - applies provider events, each once, and ends calls that must end: emergency stop, a cancel,
   a stopped campaign, do-not-call, a removed contact, no answer in time, the maximum duration;
-- after a crash first settles calls that may still exist, before it dials anything new.
+- after a crash first settles calls that may still exist, before it dials anything new;
+- ends a call the provider reports alive although wewln already counts it as ended.
 
 In this version real calls are possible only as a single test call to one number with the
 operator's permit (`wewln calls permit`), or to a local softphone (no phone network at all).
@@ -26,12 +28,13 @@ from typing import Any
 from ..config import Settings
 from ..domain import JobReason
 from ..errors import RealCallsBlockedError, WewlnError
-from ..phones import dial_policy_problem
+from ..phones import describe_number, dial_policy_problem
 from ..safety import evaluate_real_calls
 from ..storage.calls import CallStore, DialTicket, KillSwitchEngagedError, parse_iso
 from ..storage.repository import InvalidInputError
 from .base import (
     CallRequest,
+    EventKind,
     ProviderError,
     ProviderEvent,
     ProviderUncertainError,
@@ -42,6 +45,7 @@ from .lifecycle import (
     INTERRUPTED,
     KILL_SWITCH,
     MAX_DURATION,
+    REAL_CALLS_BLOCKED,
     RING_TIMEOUT,
     STATE_LOST,
     TERMINAL_STATES,
@@ -59,6 +63,11 @@ RING_GRACE_S = 15.0
 HANGUP_RECHECK_S = 5.0
 HANGUP_GIVE_UP_S = 60.0
 MAX_HANGUP_TRIES = 5
+# Ctrl+C while a dial request is on its way: how long to wait for the provider's answer, so
+# that a call it created is known (and ended) rather than left running unseen.
+PLACE_SETTLE_S = 12.0
+# How long start() waits for the calls it ends after a crash, before anything new is dialed.
+RECOVER_WAIT_S = 5.0
 
 
 class DialerBusyError(WewlnError):
@@ -136,6 +145,7 @@ class CallService:
         owner: str | None = None,
         sweep_interval: float = 0.5,
         ring_grace_s: float = RING_GRACE_S,
+        place_settle_s: float = PLACE_SETTLE_S,
         campaign_armed: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings
@@ -144,6 +154,7 @@ class CallService:
         self.owner = owner or f"dialer:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.sweep_interval = sweep_interval
         self.ring_grace_s = ring_grace_s
+        self.place_settle_s = place_settle_s
         # The operator's arming of campaign calls arrives in Phase 6; nothing arms them now.
         self._campaign_armed = campaign_armed or (lambda: False)
         self._changed = asyncio.Event()
@@ -153,6 +164,9 @@ class CallService:
         self._lock_renewed = 0.0
         # Attempts whose dial request is on its way: the provider may not know the call yet.
         self._placing: set[int] = set()
+        # Hangups of calls that were reported alive after they ended in wewln.
+        self._late_hangups: set[asyncio.Task[None]] = set()
+        self._stuck_reported: set[int] = set()
 
     @property
     def simulated(self) -> bool:
@@ -185,6 +199,8 @@ class CallService:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper
             self._sweeper = None
+        if self._late_hangups:
+            await asyncio.wait(set(self._late_hangups), timeout=HANGUP_RECHECK_S)
         with contextlib.suppress(Exception):
             await self.provider.close()
         if self._started:
@@ -210,6 +226,24 @@ class CallService:
             extra={"kind": event.kind.value, "outcome": outcome, "source": event.source},
         )
         self._changed.set()
+        if outcome == "ignored" and event.kind != EventKind.HANGUP:
+            # Maybe a call wewln already counts as ended: then it must not live on. In its own
+            # task: the provider may be delivering this event from the call it would end.
+            task = asyncio.create_task(self._end_late_call(event.call_id))
+            self._late_hangups.add(task)
+            task.add_done_callback(self._late_hangups.discard)
+
+    async def _end_late_call(self, call_id: str) -> None:
+        """The provider reports progress on a call that ended in wewln (its hangup was never
+        confirmed, or the provider created it after wewln gave up waiting): end it."""
+        attempt = await asyncio.to_thread(self.store.find_attempt, call_id)
+        if attempt is None or CallState(attempt["state"]) not in TERMINAL_STATES:
+            return
+        log.warning("call_ended_late", extra={"attempt_id": attempt["id"]})
+        try:
+            await self.provider.hangup(call_id)
+        except ProviderError as exc:
+            log.error("call_hangup_failed", extra={"attempt_id": attempt["id"], "error": exc.code})
 
     def kill_switch_engaged(self) -> bool:
         return self.settings.kill_switch or self.store.kill_switch() is not None
@@ -217,28 +251,43 @@ class CallService:
     # ------------------------------------------------------------------ recovery and sweeping
 
     async def recover(self) -> int:
-        """Settle attempts left by a previous run. Live calls are ended (no conversation is
-        resumed); calls that are gone end as "state lost" and are not repeated."""
-        settled = 0
-        for attempt in await asyncio.to_thread(self.store.active_attempts):
-            exists: bool | None = None
-            if attempt["provider"] == self.provider.info.name:
+        """Settle attempts left by a previous run, before anything new is dialed. A call that
+        may still exist is ended (no conversation is resumed), also when the provider cannot
+        tell; a call that is gone ends as "state lost". Neither is repeated."""
+        attempts = await asyncio.to_thread(self.store.active_attempts)
+        ending: set[int] = set()
+        for attempt in attempts:
+            if attempt["provider"] != self.provider.info.name:
+                # Placed through another provider: it cannot be checked from here.
+                log.warning("call_not_verifiable", extra={"attempt_id": attempt["id"]})
+                exists: bool | None = False
+            else:
                 try:
                     exists = await self.provider.call_exists(attempt["provider_call_id"])
                 except ProviderError:
                     exists = None
-            if exists:
+            if exists is not False:
                 await self._end(attempt, STATE_LOST)
+                ending.add(attempt["id"])
             else:
                 answered = attempt["state"] == CallState.ANSWERED
                 forced = (CallState.COMPLETED if answered else CallState.FAILED, STATE_LOST)
                 await asyncio.to_thread(
                     self.store.finish_without_event, attempt["id"], forced=forced
                 )
-            settled += 1
-        if settled:
-            log.warning("calls_recovered", extra={"count": settled})
-        return settled
+        if ending:
+            await self._wait_ended(ending, RECOVER_WAIT_S)
+        if attempts:
+            log.warning("calls_recovered", extra={"count": len(attempts)})
+        return len(attempts)
+
+    async def _wait_ended(self, attempt_ids: set[int], wait_s: float) -> None:
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            active = await asyncio.to_thread(self.store.active_attempts)
+            if not any(a["id"] in attempt_ids for a in active):
+                return
+            await asyncio.sleep(0.1)
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -304,7 +353,9 @@ class CallService:
                 await self._end(attempt, attempt["end_request"])
             elif exists is True:
                 # Never forgotten while it may be live: the operator must end it in Asterisk.
-                log.error("call_hangup_not_possible", extra={"attempt_id": attempt["id"]})
+                if attempt["id"] not in self._stuck_reported:
+                    self._stuck_reported.add(attempt["id"])
+                    log.error("call_hangup_not_possible", extra={"attempt_id": attempt["id"]})
             elif since > HANGUP_GIVE_UP_S:
                 await asyncio.to_thread(
                     self.store.finish_without_event,
@@ -358,15 +409,41 @@ class CallService:
         ]
         for attempt in attempts:
             await self._end(attempt, reason)
-        deadline = time.monotonic() + wait_s
-        while time.monotonic() < deadline:
-            active = await asyncio.to_thread(self.store.active_attempts)
-            if not any(a["provider"] == self.provider.info.name for a in active):
-                break
-            await asyncio.sleep(0.1)
+        await self._wait_ended({a["id"] for a in attempts}, wait_s)
         return len(attempts)
 
     # ------------------------------------------------------------------ dialing
+
+    def _dial_blocker(self, ticket: DialTicket) -> str | None:
+        """Why this attempt may not be dialed now, read again right before the dial request.
+
+        A stop since the attempt was written (emergency stop, cancel, stopped campaign,
+        do-not-call, removed contact) returns its reason. A real call that is no longer
+        permitted (production mode, the permit for the number, the allowed countries, campaign
+        arming) raises RealCallsBlockedError.
+        """
+        if self.settings.kill_switch:
+            return KILL_SWITCH
+        real = not self.simulated and ticket.target == "phone"
+        reason = self.store.dial_blocker(
+            ticket.attempt_id,
+            phone_e164=ticket.to_e164 or None,
+            real_test=real and ticket.kind == "test",
+        )
+        if reason is not None or not real:
+            return reason
+        # A test call's permit was checked just above; campaigns need the operator's arming.
+        self._real_gate(operator_armed=ticket.kind == "test" or self._campaign_armed())
+        problem = dial_policy_problem(ticket.to_e164, self.settings.allowed_call_regions)
+        if problem is not None:
+            raise RealCallsBlockedError(
+                f"this number may not be called ({problem})", details={"blocked_by": [problem]}
+            )
+        return None
+
+    def _stop_before_dial(self, attempt_id: int, reason: str) -> None:
+        self.store.request_hangup(attempt_id, reason)
+        self.store.finish_without_event(attempt_id)
 
     async def _place(self, ticket: DialTicket) -> None:
         request = CallRequest(
@@ -378,33 +455,28 @@ class CallService:
         )
         self._placing.add(ticket.attempt_id)
         try:
-            # A stop may have come since the attempt was written: then nothing is dialed.
-            fresh = await asyncio.to_thread(self.store.get_attempt, ticket.attempt_id)
-            if fresh["end_request"] is not None or CallState(fresh["state"]) != CallState.PENDING:
-                await asyncio.to_thread(self.store.finish_without_event, ticket.attempt_id)
-                log.info(
-                    "call_not_placed",
-                    extra={"attempt_id": ticket.attempt_id, "reason": fresh["end_request"]},
-                )
-                return
             try:
-                await self.provider.place_call(request)
-            except ProviderUncertainError as exc:
-                # The call may exist: it is watched like any other call and never repeated.
-                error_code: str | None = exc.code
-            except ProviderError as exc:
+                blocker = await asyncio.to_thread(self._dial_blocker, ticket)
+            except RealCallsBlockedError:
                 await asyncio.to_thread(
                     self.store.abandon_attempt,
                     ticket.attempt_id,
-                    error_code=exc.code,
-                    job_reason=JobReason.PROVIDER_ERROR,
+                    error_code=REAL_CALLS_BLOCKED,
+                    job_reason=None,
                 )
-                log.error(
-                    "call_place_failed", extra={"attempt_id": ticket.attempt_id, "error": exc.code}
+                log.warning(
+                    "call_not_placed",
+                    extra={"attempt_id": ticket.attempt_id, "reason": REAL_CALLS_BLOCKED},
                 )
                 raise
-            else:
-                error_code = None
+            if blocker is not None:
+                # A stop came since the attempt was written: nothing is dialed.
+                await asyncio.to_thread(self._stop_before_dial, ticket.attempt_id, blocker)
+                log.info(
+                    "call_not_placed", extra={"attempt_id": ticket.attempt_id, "reason": blocker}
+                )
+                return
+            error_code = await self._send(ticket, request)
             await asyncio.to_thread(
                 self.store.mark_dialing, ticket.attempt_id, error_code=error_code
             )
@@ -427,6 +499,61 @@ class CallService:
         if fresh["end_request"] is not None and CallState(fresh["state"]) not in TERMINAL_STATES:
             await self._end(fresh, fresh["end_request"])
 
+    async def _send(self, ticket: DialTicket, request: CallRequest) -> str | None:
+        """Send the dial request. Returns provider_uncertain when the call may exist although
+        no answer came; raises ProviderError (after giving the attempt back) when it certainly
+        does not exist."""
+        dial = asyncio.ensure_future(self.provider.place_call(request))
+        try:
+            await asyncio.shield(dial)
+        except ProviderUncertainError as exc:
+            # The call may exist: it is watched like any other call and never repeated.
+            return exc.code
+        except ProviderError as exc:
+            await asyncio.to_thread(
+                self.store.abandon_attempt,
+                ticket.attempt_id,
+                error_code=exc.code,
+                job_reason=JobReason.PROVIDER_ERROR,
+            )
+            log.error(
+                "call_place_failed", extra={"attempt_id": ticket.attempt_id, "error": exc.code}
+            )
+            raise
+        except BaseException:
+            # Ctrl+C, shutdown or an unexpected error while the request was on its way. The
+            # provider's answer is awaited (briefly): a call it created is then known and
+            # _call ends it. Without an answer the call may exist: it is never repeated.
+            try:
+                if not dial.done():
+                    log.warning("call_place_interrupted", extra={"attempt_id": ticket.attempt_id})
+                    await asyncio.wait({dial}, timeout=self.place_settle_s)
+            finally:
+                try:
+                    self._record_unfinished_dial(ticket.attempt_id, dial)
+                except Exception:
+                    log.exception("call_state_not_saved", extra={"attempt_id": ticket.attempt_id})
+            raise
+        return None
+
+    def _record_unfinished_dial(self, attempt_id: int, dial: asyncio.Future[Any]) -> None:
+        error: BaseException | None
+        if not dial.done():
+            dial.cancel()
+            error = ProviderUncertainError("no answer to the interrupted dial request")
+        elif dial.cancelled():
+            error = ProviderUncertainError("the dial request was cancelled")
+        else:
+            error = dial.exception()
+        if isinstance(error, ProviderError) and not error.call_may_exist:
+            self.store.abandon_attempt(
+                attempt_id, error_code=error.code, job_reason=JobReason.PROVIDER_ERROR
+            )
+        else:
+            # Taken by the provider (the call exists) or unknown: watched, ended, not repeated.
+            code = None if error is None else ProviderUncertainError.code
+            self.store.mark_dialing(attempt_id, error_code=code)
+
     async def wait_for_end(self, attempt_id: int) -> CallOutcome:
         while True:
             row = await asyncio.to_thread(self.store.get_attempt, attempt_id)
@@ -440,8 +567,11 @@ class CallService:
         try:
             await self._place(ticket)
             return await self.wait_for_end(ticket.attempt_id)
-        except asyncio.CancelledError:
-            # Ctrl+C or shutdown during a call: end it instead of leaving it running.
+        except (ProviderError, RealCallsBlockedError):
+            raise  # nothing was dialed (see _place)
+        except BaseException:
+            # Ctrl+C, shutdown or an unexpected error during a call: end it instead of
+            # leaving it running.
             with contextlib.suppress(Exception):
                 await asyncio.shield(self.hangup_all(INTERRUPTED))
             raise
@@ -512,6 +642,10 @@ class CallService:
             problem = dial_policy_problem(to_e164, self.settings.allowed_call_regions)
             if problem is not None:
                 raise InvalidInputError(f"this number may not be called ({problem})")
+            info = describe_number(to_e164)
+            if info is None:  # pragma: no cover - the policy check above rejects these
+                raise InvalidInputError("this number may not be called (invalid)")
+            to_e164 = info.e164  # the canonical form permits and do-not-call entries use
             if not self.simulated:
                 armed = await asyncio.to_thread(self.store.has_valid_permit, to_e164)
                 await asyncio.to_thread(self._real_gate, operator_armed=armed)

@@ -1,6 +1,7 @@
 """The call service with the mock provider: lifecycle, retries, cancels, timeouts, recovery."""
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ import pytest
 from wewln_phonecaller.config import PRODUCTION_CONFIRM_PHRASE
 from wewln_phonecaller.domain import CampaignStatus
 from wewln_phonecaller.errors import RealCallsBlockedError
-from wewln_phonecaller.storage import Database
+from wewln_phonecaller.storage import MIGRATIONS, Database
 from wewln_phonecaller.storage.calls import CallStore, KillSwitchEngagedError, iso
 from wewln_phonecaller.storage.repository import ContactInput, InvalidInputError
 from wewln_phonecaller.telephony import ProviderInfo
@@ -60,6 +61,13 @@ class FailingMock(MockTelephonyProvider):
 
     async def place_call(self, request):
         raise self.error
+
+
+class UnsureMock(MockTelephonyProvider):
+    """Cannot tell whether a call exists (as when Asterisk answers that question with 500)."""
+
+    async def call_exists(self, call_id):
+        return None
 
 
 class SlowDialMock(MockTelephonyProvider):
@@ -223,6 +231,9 @@ async def test_repeated_events_are_applied_once(world):
     late = ProviderEvent(attempt["provider_call_id"], EventKind.RINGING, "late-event-1", "test")
     assert w.store.apply_event(late) == "ignored"
     assert w.store.apply_event(late) == "duplicate"
+    long_key = ProviderEvent(attempt["provider_call_id"], EventKind.RINGING, "k" * 250, "test")
+    assert w.store.apply_event(long_key) == "ignored"
+    assert w.store.apply_event(long_key) == "duplicate"  # keys are stored cut to 200 characters
     unknown = ProviderEvent("wewln-" + "0" * 32, EventKind.HANGUP, "unknown-event-1", "test")
     assert w.store.apply_event(unknown) == "unknown_call"
 
@@ -420,6 +431,24 @@ async def test_restart_ends_a_call_that_is_still_live(world):
     assert w.provider.hangups == [ticket.call_id]
 
 
+async def test_restart_ends_a_call_the_provider_cannot_account_for(world):
+    w = world(PHONE, provider=UnsureMock("silent", time_scale=0))
+    ticket = w.store.begin_job_attempt(provider="mock", simulated=True)
+
+    async def ignore(event):
+        return None
+
+    await w.provider.start(ignore)  # the "crashed" process placed the call
+    await w.provider.place_call(CallRequest(ticket.call_id, ticket.to_e164, 30))
+    w.store.mark_dialing(ticket.attempt_id)
+    async with w.service:  # recovery is over before anything new could be dialed
+        assert active(w) == []
+    assert w.provider.hangups == [ticket.call_id]  # ended, not just forgotten
+    attempt = w.store.get_attempt(ticket.attempt_id)
+    assert (attempt["state"], attempt["end_reason"]) == ("failed", "state_lost")
+    assert jobs(w) == [("failed", "state_lost", 1)]
+
+
 async def test_only_one_dialer_at_a_time(world):
     w = world()
     other = CallService(w.settings, w.store, MockTelephonyProvider(time_scale=0))
@@ -466,6 +495,172 @@ async def test_interrupted_run_ends_the_call(world):
     (attempt,) = w.store.list_attempts()
     assert (attempt["state"], attempt["end_reason"]) == ("cancelled", "interrupted")
     assert jobs(w) == [("queued", None, 1)]
+
+
+async def test_ctrl_c_during_the_dial_request_never_dials_the_number_again(world):
+    # The provider never answers the interrupted request: the call may exist, so the attempt
+    # is not given back and the job is not retried.
+    w = world(PHONE, max_attempts=3, provider=SlowDialMock(scenario="silent", time_scale=0))
+    w.service.place_settle_s = 0.2
+    async with w.service:
+        task = asyncio.create_task(w.service.run_jobs())
+        await asyncio.wait_for(w.provider.sent.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    (attempt,) = w.store.list_attempts()
+    assert (attempt["state"], attempt["end_reason"]) == ("failed", "provider_uncertain")
+    assert jobs(w) == [("failed", "provider_error", 1)]
+    async with w.service:
+        report = await w.service.run_jobs()
+    assert (report.placed, w.provider.placed) == (0, [])
+
+
+async def test_ctrl_c_during_the_dial_request_waits_for_the_answer_and_hangs_up(world):
+    w = world(PHONE, max_attempts=2, provider=SlowDialMock(scenario="silent", time_scale=0))
+    async with w.service:
+        task = asyncio.create_task(w.service.run_jobs())
+        await asyncio.wait_for(w.provider.sent.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        w.provider.release.set()  # the provider answers after all: the call exists
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    (request,) = w.provider.placed
+    assert w.provider.hangups == [request.call_id]
+    (attempt,) = w.store.list_attempts()
+    assert (attempt["state"], attempt["end_reason"]) == ("cancelled", "interrupted")
+    assert jobs(w) == [("queued", None, 1)]  # the next attempt, within «Макс. попыток»
+
+
+async def test_an_unexpected_error_during_a_call_still_ends_it(world, monkeypatch):
+    w = world(PHONE, scenario="silent")
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(w.store, "mark_dialing", broken)
+    async with w.service:
+        with pytest.raises(sqlite3.OperationalError):
+            await asyncio.wait_for(w.service.run_jobs(), 5)
+        (request,) = w.provider.placed
+        assert w.provider.hangups == [request.call_id]
+        assert active(w) == []
+
+
+async def test_a_call_reported_alive_after_it_ended_is_hung_up(world):
+    # Its hangup was never confirmed (or the provider created it after wewln gave up).
+    w = world(provider=MockTelephonyProvider("answer_hold", time_scale=0))
+    ticket = w.store.begin_test_attempt(provider="mock", simulated=True, to_e164=PHONE)
+    w.store.mark_dialing(ticket.attempt_id)
+    w.store.finish_without_event(ticket.attempt_id, forced=(CallState.FAILED, "hangup_unconfirmed"))
+    async with w.service:
+        await w.provider.place_call(CallRequest(ticket.call_id, PHONE, 30))
+        await until(lambda: w.provider.hangups == [ticket.call_id])
+    attempt = w.store.get_attempt(ticket.attempt_id)
+    assert (attempt["state"], attempt["end_reason"]) == ("failed", "hangup_unconfirmed")
+
+
+async def test_everything_is_checked_again_right_before_the_dial_request(world, monkeypatch):
+    # An emergency stop after the attempt was written, before the sweeper has seen it.
+    w = world(PHONE, max_attempts=2)
+    w.service.sweep_interval = 60
+    begin = w.store.begin_job_attempt
+
+    def begin_then_stop(**kwargs):
+        ticket = begin(**kwargs)
+        if ticket is not None:
+            w.store.engage_kill_switch(source="test", reason="drill")
+        return ticket
+
+    monkeypatch.setattr(w.store, "begin_job_attempt", begin_then_stop)
+    async with w.service:
+        report = await asyncio.wait_for(w.service.run_jobs(), 5)
+    (outcome,) = report.outcomes
+    assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
+    assert w.provider.placed == []
+    assert report.stopped_by == "kill_switch"
+
+
+async def test_a_permit_revoked_before_the_dial_request_stops_the_call(world, monkeypatch):
+    w = world(provider=RealMock(time_scale=0), **REAL)
+    w.service.sweep_interval = 60
+    w.store.create_permit(PHONE, minutes=5)
+    begin = w.store.begin_test_attempt
+
+    def begin_then_revoke(**kwargs):
+        ticket = begin(**kwargs)
+        assert w.store.revoke_permits() == 1  # also the permit this call has just used
+        return ticket
+
+    monkeypatch.setattr(w.store, "begin_test_attempt", begin_then_revoke)
+    async with w.service:
+        with pytest.raises(RealCallsBlockedError) as blocked:
+            await w.service.test_call(to_e164=PHONE)
+    assert blocked.value.details["blocked_by"] == ["operator_not_armed"]
+    assert w.provider.placed == []
+    (attempt,) = w.store.list_attempts()
+    assert (attempt["state"], attempt["end_reason"]) == ("failed", "real_calls_blocked")
+
+
+async def test_campaign_arming_is_checked_again_at_the_dial(world):
+    w = world(PHONE, max_attempts=2, **REAL)
+    armed = iter([True, False])  # armed when the run starts, no longer when it would dial
+    service = CallService(
+        w.settings,
+        w.store,
+        RealMock(time_scale=0),
+        campaign_armed=lambda: next(armed),
+        sweep_interval=0.01,
+    )
+    async with service:
+        with pytest.raises(RealCallsBlockedError) as blocked:
+            await service.run_jobs()
+    assert "operator_not_armed" in blocked.value.details["blocked_by"]
+    assert service.provider.placed == []
+    assert jobs(w) == [("queued", None, 0)]  # the attempt was given back
+
+
+async def test_test_call_numbers_are_dialed_in_canonical_form(world):
+    w = world(call_regions="AZ")
+    async with w.service:
+        await w.service.test_call(to_e164="+994 50 123 45 60")
+    assert w.provider.placed[-1].to_e164 == PHONE
+
+
+def test_a_phase_3_database_upgrades_and_its_jobs_can_be_called(make_settings):
+    settings = make_settings()
+    old = Database(settings.resolved_db_path, migrations=MIGRATIONS[:2])
+    assert old.migrate() == 2
+    now = iso(datetime.now(UTC))
+    with old.connect() as conn:
+        conn.execute(
+            "INSERT INTO campaigns (source, name, status, max_attempts, created_at, updated_at) "
+            "VALUES ('local', 'Фаза 3', 'running', 3, ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO contacts (source, name, phone_raw, phone_e164, created_at, updated_at) "
+            "VALUES ('local', 'Анна', ?, ?, ?, ?)",
+            (PHONE, PHONE, now, now),
+        )
+        conn.execute("INSERT INTO campaign_contacts VALUES (1, 1, ?)", (now,))
+        conn.execute(
+            "INSERT INTO call_jobs (campaign_id, contact_id, idempotency_key, status, attempts, "
+            "created_at, updated_at) VALUES (1, 1, 'job-1', 'queued', 1, ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO call_results (job_id, attempt, idempotency_key, outcome, started_at, "
+            "created_at) VALUES (1, 1, 'result-1', 'no_answer', ?, ?)",
+            (now, now),
+        )
+    db = Database(settings.resolved_db_path)
+    assert db.migrate() == MIGRATIONS[-1].version
+    store = CallStore(create_repository(settings, db))
+    ticket = store.begin_job_attempt(provider="mock", simulated=True)
+    assert (ticket.job_id, ticket.attempt) == (1, 2)  # after the Phase 3 attempt, never over it
+    assert len(rows(SimpleNamespace(db=db), "SELECT id FROM call_results")) == 1
 
 
 async def test_mock_test_calls_are_simulated_and_follow_the_policy(world):
