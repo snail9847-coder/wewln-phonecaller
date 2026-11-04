@@ -436,8 +436,10 @@ class CallStore:
     # ------------------------------------------------------------------ events and endings
 
     def apply_event(self, event: ProviderEvent) -> str:
-        """Store and apply one provider event. Returns applied, ignored, duplicate or
-        unknown_call. A repeated event (same key) is never applied twice."""
+        """Store and apply one provider event. Returns applied, ignored, duplicate,
+        unknown_call or after_end: progress on a call that ended in wewln although the
+        provider never reported its end (the call may live on). A repeated event (same key)
+        is never applied twice."""
         now = self.now()
         now_s = iso(now)
         key = event.event_key[:200]  # the same (stored) key for the check and the insert
@@ -451,6 +453,13 @@ class CallStore:
                 outcome = "unknown_call"
             elif CallState(attempt["state"]) in TERMINAL_STATES:
                 outcome = "ignored"
+                if event.kind != EventKind.HANGUP:
+                    reported_end = conn.execute(
+                        "SELECT 1 FROM call_events WHERE attempt_id = ? AND kind = ? LIMIT 1",
+                        (attempt["id"], EventKind.HANGUP.value),
+                    ).fetchone()
+                    if reported_end is None:
+                        outcome = "after_end"
             elif event.kind == EventKind.HANGUP:
                 self._finish(
                     conn,

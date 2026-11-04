@@ -7,6 +7,7 @@ reaches real phones can only be shown with a SIP account; see docs/ASTERISK.md.
 import asyncio
 import base64
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -309,6 +310,35 @@ async def test_emergency_stop_hangs_up_over_ari(ari_world, ari_sim):
         "DELETE"
     ) == 1
     assert ari_sim.channels == {}
+
+
+async def test_a_repeated_ringing_signal_does_not_end_the_call_twice(
+    ari_world, ari_sim, monkeypatch
+):
+    # Asterisk reports ringing twice (ChannelStateChange and Dial); the second report changes
+    # nothing. A slow lookup must not turn it into a second hangup once the call has ended.
+    ari_sim.default_scenario = "ringing"
+    w = ari_world()
+    w.store.create_permit(PHONE, minutes=5)
+    find_attempt = w.store.find_attempt
+
+    def slow_find_attempt(call_id):
+        time.sleep(0.5)
+        return find_attempt(call_id)
+
+    def ringing_events():
+        with w.store.db.connect(must_exist=True) as conn:
+            return conn.execute("SELECT id FROM call_events WHERE kind = 'ringing'").fetchall()
+
+    monkeypatch.setattr(w.store, "find_attempt", slow_find_attempt)
+    async with w.service:
+        task = asyncio.create_task(w.service.test_call(to_e164=PHONE))
+        await until(lambda: len(ringing_events()) == 2)
+        w.store.engage_kill_switch(source="test", reason="stop")
+        outcome = await asyncio.wait_for(task, 5)
+    assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
+    methods = [r[0] for r in ari_sim.requests if r[1].startswith("/ari/channels/wewln-")]
+    assert methods.count("DELETE") == 1
 
 
 async def test_emergency_stop_while_asterisk_creates_the_channel(ari_world, ari_sim):
