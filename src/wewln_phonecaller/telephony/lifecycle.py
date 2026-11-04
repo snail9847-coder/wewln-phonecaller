@@ -73,6 +73,8 @@ CANCELLED_BY_OPERATOR = "cancelled"
 STATE_LOST = "state_lost"
 HANGUP_UNCONFIRMED = "hangup_unconfirmed"
 INTERRUPTED = "interrupted"
+# The check right before the dial request found the real call no longer permitted.
+REAL_CALLS_BLOCKED = "real_calls_blocked"
 
 # Failures after which repeating the attempt cannot help.
 NON_RETRYABLE_FAILURES = frozenset({"provider_rejected", "provider_refused", "provider_uncertain"})
@@ -196,6 +198,7 @@ _END_TEXT = {
     "provider_rejected": "провайдер отклонил запрос: проверьте настройки",
     "provider_unavailable": "провайдер недоступен",
     "provider_uncertain": "нет ответа от провайдера: звонок мог начаться, повтор не делался",
+    REAL_CALLS_BLOCKED: "реальный звонок больше не разрешён: номер не набирался",
     "ended_before_ringing": "звонок прервался до вызова",
 }
 

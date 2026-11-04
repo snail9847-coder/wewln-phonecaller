@@ -857,7 +857,7 @@ def cmd_calls_run(args: argparse.Namespace) -> int:
     except RealCallsBlockedError as exc:
         return _blocked(exc)
     except KeyboardInterrupt:
-        print("Interrupted: calls in progress were ended.", file=sys.stderr)
+        print("Interrupted: calls in progress were ended; see `wewln calls list`.", file=sys.stderr)
         return 130
     simulated = all(o.simulated for o in report.outcomes)
     print(
@@ -916,7 +916,7 @@ def cmd_calls_test(args: argparse.Namespace) -> int:
     except RealCallsBlockedError as exc:
         return _blocked(exc)
     except KeyboardInterrupt:
-        print("Interrupted: the call was ended.", file=sys.stderr)
+        print("Interrupted: the call was ended; see `wewln calls list`.", file=sys.stderr)
         return 130
     print(_outcome_line(outcome))
     return EXIT_OK
