@@ -308,6 +308,32 @@ async def test_emergency_stop_hangs_up_over_ari(ari_world, ari_sim):
     assert ari_sim.channels == {}
 
 
+async def test_emergency_stop_while_asterisk_creates_the_channel(ari_world, ari_sim):
+    # The channel already exists, but the dial request has not returned yet.
+    ari_sim.default_scenario = "ringing"
+    ari_sim.post_behavior = "create_then_timeout"
+    ari_sim.post_delay = 1.0
+    w = ari_world()
+    w.store.create_permit(PHONE, minutes=5)
+
+    def deletes():
+        methods = [r[0] for r in ari_sim.requests if r[1].startswith("/ari/channels/wewln-")]
+        return methods.count("DELETE")
+
+    async with w.service:
+        task = asyncio.create_task(w.service.test_call(to_e164=PHONE))
+        await until(lambda: len(ari_sim.channels) == 1)
+        w.store.engage_kill_switch(source="test", reason="stop")
+        requests = lambda: [a["end_request"] for a in w.store.active_attempts()]  # noqa: E731
+        await until(lambda: requests() == ["kill_switch"])
+        await asyncio.sleep(0.1)
+        assert deletes() == 0  # recorded; the hangup waits for the dial request to return
+        outcome = await asyncio.wait_for(task, 5)
+    assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
+    assert deletes() == 1
+    assert ari_sim.channels == {}
+
+
 async def test_restart_ends_a_call_still_live_in_asterisk(ari_world, ari_sim):
     ari_sim.default_scenario = "ringing"
     w = ari_world()
