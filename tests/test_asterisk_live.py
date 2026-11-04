@@ -227,3 +227,37 @@ async def test_live_voice_call_audio_goes_both_ways(live_voice):
     assert outcome.end_reason == "conversation_end"
     # About the greeting's 1.2 s came back.
     assert w.runtime.stt.heard_ms[0] >= 800, w.runtime.stt.heard_ms
+
+
+async def test_live_audio_channel_dropped_mid_call_is_reconnected(live_voice, caplog):
+    # What the AudioSocket bug of Asterisk 22.5.2 does, done on purpose: the audio channel
+    # hangs up while the call stays up (Echo keeps it up). wewln connects a new one.
+    w = live_voice(
+        heard=["эхо", "эхо", "эхо"],
+        replies=["Повторите, пожалуйста.", "До свидания! [END]", "До свидания! [END]"],
+        barge_in=False,
+    )
+    async with w.service:
+        w.store.create_permit(ECHO, minutes=5)
+        task = asyncio.create_task(w.service.test_call(to_e164=ECHO))
+
+        def heard_once():
+            active = w.store.list_attempts(active_only=True)
+            if not active:
+                return None
+            attempt = w.store.get_attempt(active[0]["id"])
+            turns = w.store.transcript(attempt["id"])
+            return attempt if any(t["kind"] == "speech" for t in turns) else None
+
+        for _ in range(400):
+            if heard_once() or task.done():
+                break
+            await asyncio.sleep(0.05)
+        attempt = heard_once()
+        assert attempt is not None, "wewln heard nothing before the drop"
+        media_id = attempt["provider_call_id"] + "-media"
+        assert await w.service.provider._request("DELETE", f"/ari/channels/{media_id}") == 204
+        outcome = await asyncio.wait_for(task, 40)
+    assert (outcome.state, outcome.end_reason) == (CallState.COMPLETED, "conversation_end"), outcome
+    assert "call_media_reconnected" in caplog.text
+    assert outcome.voice_turns >= 2
