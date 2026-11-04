@@ -16,6 +16,7 @@ from voice_fakes import FAST_FRAME_S, FakeTts, fake_runtime
 from wewln_phonecaller.config import PRODUCTION_CONFIRM_PHRASE
 from wewln_phonecaller.storage import Database
 from wewln_phonecaller.storage.calls import CallStore
+from wewln_phonecaller.telephony import asterisk
 from wewln_phonecaller.telephony.base import MediaError
 from wewln_phonecaller.telephony.factory import create_provider, create_repository
 from wewln_phonecaller.telephony.lifecycle import CallState
@@ -148,6 +149,74 @@ async def test_the_person_hanging_up_ends_the_conversation(voice_ari, ari_sim):
         "caller_hangup",
     )
     assert ari_sim.channels == {} and ari_sim.bridges == {}
+
+
+async def until(predicate, limit_s=10.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + limit_s
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition not reached")
+        await asyncio.sleep(0.01)
+
+
+async def test_audio_dropped_by_asterisk_is_reconnected(voice_ari, ari_sim, caplog):
+    # Asterisk 22.5 may hang up the AudioSocket channel in the middle of a call; the call stays
+    # up. The person waits 1 s before speaking again, longer than the reconnect takes.
+    made = callers(ari_sim, ["Алло, слушаю.", "Да, хорошо."], hangup_after=False, pause_ms=4000)
+    w = voice_ari(
+        heard=["Алло, слушаю.", "Да, хорошо."],
+        replies=["Это проверка связи.", "Спасибо, до свидания! [END]"],
+    )
+    w.store.create_permit(PHONE, minutes=5)
+
+    async def drop_after_the_first_reply():
+        await until(lambda: len(made) == 1 and len(made[0].said) == 1)
+        attempt_id = w.store.list_attempts(active_only=True)[0]["id"]
+        await until(lambda: len(w.store.transcript(attempt_id)) >= 3)
+        (media_id,) = ari_sim.media
+        await ari_sim.drop_media(media_id)
+
+    async with w.service:
+        dropper = asyncio.create_task(drop_after_the_first_reply())
+        outcome = await w.service.test_call(to_e164=PHONE)
+        await dropper
+    assert (outcome.state, outcome.end_reason, outcome.voice_end, outcome.voice_turns) == (
+        CallState.COMPLETED,
+        "conversation_end",
+        "conversation_end",
+        2,
+    )
+    call_id = w.store.get_attempt(outcome.attempt_id)["provider_call_id"]
+    media = [q["channelId"] for _, q in requests_to(ari_sim, "/ari/channels/externalMedia")]
+    assert media == [f"{call_id}-media", f"{call_id}-media-2"]
+    assert requests_to(ari_sim, f"/ari/bridges/{call_id}-bridge/addChannel") == [
+        ("POST", {"channel": f"{call_id},{call_id}-media"}),
+        ("POST", {"channel": f"{call_id}-media-2"}),
+    ]
+    assert ari_sim.media_drops == 1 and made[0].said == ["Алло, слушаю.", "Да, хорошо."]
+    assert "call_media_reconnected" in caplog.text
+    assert ari_sim.channels == {} and ari_sim.bridges == {} and ari_sim.media == {}
+
+
+async def test_audio_lost_too_often_ends_the_call(voice_ari, ari_sim, monkeypatch):
+    monkeypatch.setattr(asterisk, "MAX_MEDIA_RECONNECTS", 0)
+    made = callers(ari_sim, ["Алло, слушаю."], hangup_after=False, pause_ms=4000)
+    w = voice_ari(heard=["Алло, слушаю."], replies=["Это проверка связи."])
+    w.store.create_permit(PHONE, minutes=5)
+
+    async def drop():
+        await until(lambda: len(made) == 1 and made[0].said)
+        (media_id,) = ari_sim.media
+        await ari_sim.drop_media(media_id)
+
+    async with w.service:
+        dropper = asyncio.create_task(drop())
+        outcome = await w.service.test_call(to_e164=PHONE)
+        await dropper
+    assert (outcome.state, outcome.end_reason) == (CallState.COMPLETED, "media_lost")
+    assert len(requests_to(ari_sim, "/ari/channels/externalMedia")) == 1
+    assert ari_sim.channels == {} and ari_sim.bridges == {} and ari_sim.media == {}
 
 
 async def test_audio_that_cannot_connect_ends_the_call(voice_ari, ari_sim):
