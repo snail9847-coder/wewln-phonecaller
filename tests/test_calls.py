@@ -254,6 +254,23 @@ def test_states_only_move_forward(world):
     assert rows(w, "SELECT id FROM call_results") == []  # test calls have no job results
 
 
+def test_progress_after_an_end_the_provider_never_reported_is_flagged(world):
+    w = world()
+    ticket = w.store.begin_test_attempt(provider="mock", simulated=True, to_e164=PHONE)
+
+    def event(kind, key):
+        return ProviderEvent(ticket.call_id, kind, key, "test")
+
+    assert w.store.apply_event(event(EventKind.RINGING, "r-1")) == "applied"
+    # A second ringing signal changes nothing; the call is not taken for one alive after its end.
+    assert w.store.apply_event(event(EventKind.RINGING, "r-2")) == "ignored"
+    w.store.finish_without_event(ticket.attempt_id, forced=(CallState.FAILED, "hangup_unconfirmed"))
+    assert w.store.apply_event(event(EventKind.ANSWERED, "a-1")) == "after_end"
+    assert w.store.apply_event(event(EventKind.HANGUP, "h-1")) == "ignored"
+    # Once the provider has reported the end, later progress is stale.
+    assert w.store.apply_event(event(EventKind.ANSWERED, "a-2")) == "ignored"
+
+
 async def test_silent_call_ends_at_the_ring_timeout(world):
     w = world(PHONE, scenario="silent")
     async with w.service:
