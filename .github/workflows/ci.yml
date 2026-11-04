@@ -54,3 +54,64 @@ jobs:
 
       - name: CLI check-config
         run: python -m wewln_phonecaller check-config
+
+  asterisk-live:
+    # A real Asterisk from Ubuntu's packages (24.04: Asterisk 20 LTS, 26.04: Asterisk 22 LTS),
+    # driven over ARI. Calls go to Local channels of a test dialplan: no SIP account, no phone
+    # network, nothing leaves the runner.
+    name: ${{ matrix.os }} / live Asterisk (ARI)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    defaults:
+      run:
+        # bash -eo pipefail: a failing command fails the step even when piped into tee.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install and configure Asterisk with the sample files
+        run: bash deploy/asterisk/ci/setup.sh 2>&1 | tee setup.log
+
+      - name: Install wewln
+        run: |
+          python3 --version
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -e ".[dev]"
+
+      - name: Live ARI tests
+        env:
+          ASTERISK_LIVE_ARI_URL: http://127.0.0.1:8088
+          ASTERISK_LIVE_ARI_USER: wewln
+        run: |
+          .venv/bin/python -m pytest -q -m asterisk_live -p no:cacheprovider -rfE --tb=short \
+            2>&1 | tee pytest-live.log
+
+      - name: wewln telephony check against the live Asterisk
+        env:
+          WEWLN_TELEPHONY_PROVIDER: asterisk
+          WEWLN_ARI_PASSWORD: ${{ env.ASTERISK_LIVE_ARI_PASSWORD }}
+          WEWLN_ASTERISK_ENDPOINT: "Local/{number}@wewln-ci"
+          WEWLN_LOG_TO_FILE: "false"
+        run: .venv/bin/python -m wewln_phonecaller telephony check 2>&1 | tee telephony-check.log
+
+      - name: Asterisk log
+        if: always()
+        run: |
+          {
+            sudo asterisk -rx "core show channels" || true
+            sudo tail -n 120 /var/log/asterisk/ci.log 2>/dev/null || true
+            sudo tail -n 60 /var/log/asterisk/messages.log 2>/dev/null \
+              || sudo tail -n 60 /var/log/asterisk/messages 2>/dev/null || true
+          } 2>&1 | tee asterisk.log
+
+      - name: Failure details as annotations (readable on the run page)
+        if: failure()
+        run: >-
+          python3 deploy/asterisk/ci/annotate.py
+          setup.log pytest-live.log telephony-check.log asterisk.log

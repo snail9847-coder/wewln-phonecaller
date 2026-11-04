@@ -1,20 +1,14 @@
-"""Telephony provider registry.
+"""Telephony providers.
 
-This version ships only the simulation provider. Real adapters (SIP/PBX or a carrier API) are
-added in Phase 4 and must declare `places_real_calls=True` to be usable at all.
+- `mock`: simulated calls with realistic states (ringing, answer, busy …); never touches a network.
+- `asterisk`: your own Asterisk PBX (in WSL2 on Windows) controlled over ARI; calls reach the phone
+  network only through a SIP trunk configured in Asterisk. It can place real calls, so it is
+  usable only behind the real-call gate (safety.py).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class ProviderInfo:
-    name: str
-    places_real_calls: bool
-    description: str
-
+from .base import ProviderInfo
 
 PROVIDERS: dict[str, ProviderInfo] = {
     "mock": ProviderInfo(
@@ -22,4 +16,11 @@ PROVIDERS: dict[str, ProviderInfo] = {
         places_real_calls=False,
         description="Simulated calls only; never touches a phone network.",
     ),
+    "asterisk": ProviderInfo(
+        name="asterisk",
+        places_real_calls=True,
+        description="Own Asterisk PBX over ARI; the phone network only through its SIP trunk.",
+    ),
 }
+
+__all__ = ["PROVIDERS", "ProviderInfo"]
