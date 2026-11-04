@@ -68,6 +68,7 @@ def callers(ari_sim, phrases, **kwargs):
 
     async def person(line):
         kwargs.setdefault("pause_ms", 600)
+        kwargs.setdefault("hangup_pause_ms", 4000)  # wewln's goodbye ends the call first
         caller = SimulatedCaller(
             line, list(phrases), FakeTts(660.0), frame_s=FAST_FRAME_S, **kwargs
         )

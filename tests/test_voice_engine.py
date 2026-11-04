@@ -198,3 +198,19 @@ async def test_an_echo_of_the_assistants_voice_is_not_speech(echo_ms):
     assert kinds(result) == ["greeting", "goodbye"]
     assert not result.turns[0].interrupted
     assert stt.heard_ms == [] and result.reason == NO_INPUT
+
+
+@pytest.mark.parametrize(("hangup_pause_ms", "quiet_frames"), [(None, 10), (1000, 50)])
+async def test_the_simulated_person_hangs_up_after_the_hangup_pause(hangup_pause_ms, quiet_frames):
+    from wewln_phonecaller.voice.simulate import SimulatedCaller
+
+    call, phone = memory_pair()
+    caller = SimulatedCaller(
+        phone, [], FakeTts(), frame_s=FAST_FRAME_S, pause_ms=200, hangup_pause_ms=hangup_pause_ms
+    )
+    for frame in frames(tone(440.0, 200)):
+        await call.write(frame)
+    await asyncio.wait_for(caller.run(), 5)
+    # It hung up after the assistant had been quiet for the pause (20 ms per frame).
+    assert quiet_frames <= len(caller.caller_track) <= quiet_frames + 5
+    assert phone.closed_here

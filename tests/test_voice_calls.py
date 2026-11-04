@@ -46,6 +46,9 @@ def person(phrases, recorder=None, **kwargs):
 
     async def run(request, phone):
         kwargs.setdefault("frame_s", FAST_FRAME_S)
+        # After the last phrase the person waits 1 s (4 s of call audio) before hanging up,
+        # so that wewln's goodbye always ends the call first, even on a slow CI runner.
+        kwargs.setdefault("hangup_pause_ms", 4000)
         caller = SimulatedCaller(phone, list(phrases), FakeTts(660.0), pause_ms=600, **kwargs)
         if recorder is not None:
             recorder.append(caller)
