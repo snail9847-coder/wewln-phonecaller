@@ -131,8 +131,11 @@ class AsteriskAriProvider(TelephonyProvider):
         return self._connected.is_set()
 
     def _new_session(self) -> aiohttp.ClientSession:
+        # The connect limit is shorter than the total one, so that a connection that never
+        # came about (nothing was sent) is told apart from a request left without an answer.
+        connect = min(self.cfg.connect_timeout, self.cfg.request_timeout / 2)
         return aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.cfg.request_timeout),
+            timeout=aiohttp.ClientTimeout(total=self.cfg.request_timeout, connect=connect),
             raise_for_status=False,
         )
 
@@ -345,7 +348,8 @@ class AsteriskAriProvider(TelephonyProvider):
                     with contextlib.suppress(ValueError, aiohttp.ContentTypeError):
                         body = await resp.json()
                 return resp.status, body
-        except aiohttp.ClientConnectorError as exc:
+        except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as exc:
+            # The request was certainly not sent.
             raise ProviderUnavailableError(
                 f"cannot connect to Asterisk ARI ({type(exc).__name__})"
             ) from None
@@ -443,6 +447,8 @@ class AsteriskAriProvider(TelephonyProvider):
             return {**result, "status": "error", "error": exc.message}
         if status in (401, 403):
             return {**result, "status": "error", "error": "ARI rejected the user name or password"}
+        if status is None:
+            return {**result, "status": "error", "error": "Asterisk ARI did not answer in time"}
         if status != 200:
             return {**result, "status": "error", "error": f"ARI answered HTTP {status}"}
         result["asterisk_version"] = ((info or {}).get("system") or {}).get("version")
