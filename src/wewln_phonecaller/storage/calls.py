@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..domain import FINAL_CAMPAIGN_STATUSES, JobReason, JobStatus
+from ..domain import FINAL_CAMPAIGN_STATUSES, JobReason, JobStatus, Outcome
 from ..errors import RealCallsBlockedError, WewlnError
 from ..redact import mask_phone_numbers
 from ..telephony.base import EventKind, ProviderEvent, provider_call_id
@@ -48,6 +48,24 @@ from .repository import (
 
 KILL_SWITCH_FLAG = "kill_switch"
 EVENT_RETENTION_DAYS = 30
+TURN_TEXT_LIMIT = 2000
+_TURN_COLUMNS = (
+    "seq",
+    "role",
+    "kind",
+    "text",
+    "interrupted",
+    "at_ms",
+    "speech_ms",
+    "stt_ms",
+    "llm_ms",
+    "tts_ms",
+    "response_ms",
+)
+_TRANSCRIPT_SQL = (
+    "SELECT seq, role, kind, text, interrupted, at_ms, speech_ms, stt_ms, llm_ms, tts_ms, "
+    "response_ms FROM call_turns WHERE attempt_id = ? ORDER BY seq"
+)
 MAX_PERMIT_MINUTES = 60
 MAX_PERMIT_CALLS = 3
 _STATE_BY_EVENT = {
@@ -574,7 +592,7 @@ class CallStore:
                 job["id"],
                 attempt["attempt"],
                 result_key(job["idempotency_key"], attempt["attempt"]),
-                OUTCOME_BY_STATE[final].value,
+                _outcome(final, bool(attempt["opt_out"])).value,
                 int(simulated),
                 iso(started),
                 round(duration, 1),
@@ -585,6 +603,9 @@ class CallStore:
                     cause=cause,
                     cause_txt=cause_txt,
                     simulated=simulated,
+                    voice_end=attempt["voice_end"],
+                    voice_turns=attempt["voice_turns"],
+                    opt_out=bool(attempt["opt_out"]),
                 ),
                 now_s,
             ),
@@ -757,6 +778,7 @@ class CallStore:
             "SELECT a.id, a.kind, a.job_id, a.attempt, a.provider, a.simulated, a.target, "
             "a.phone_masked, a.state, a.end_reason, a.end_request, a.hangup_cause, "
             "a.tech_cause, a.error_code, a.created_at, a.answered_at, a.ended_at, "
+            "a.voice_end, a.opt_out, a.voice_turns, "
             "c.name AS campaign_name FROM call_attempts a "
             "LEFT JOIN call_jobs j ON j.id = a.job_id LEFT JOIN campaigns c ON c.id = j.campaign_id"
         )
@@ -770,6 +792,111 @@ class CallStore:
         cutoff = iso(self.now() - timedelta(days=days))
         with self.db.transaction() as conn:
             return conn.execute("DELETE FROM call_events WHERE received_at < ?", (cutoff,)).rowcount
+
+    # ------------------------------------------------------------------ conversations (voice)
+
+    def conversation_script(self, attempt_id: int) -> str | None:
+        """The campaign's «Сценарий» for a campaign call; None for a test call."""
+        with self.db.connect(must_exist=True) as conn:
+            row = conn.execute(
+                "SELECT c.script FROM call_attempts a JOIN call_jobs j ON j.id = a.job_id "
+                "JOIN campaigns c ON c.id = j.campaign_id WHERE a.id = ?",
+                (attempt_id,),
+            ).fetchone()
+        script = (row["script"] or "").strip() if row is not None else ""
+        return script or None
+
+    def add_turn(self, attempt_id: int, turn: dict[str, Any]) -> None:
+        """One phrase of the transcript (a repeated phrase number is ignored)."""
+        values = [turn.get(name) for name in _TURN_COLUMNS]
+        values[3] = str(values[3] or "")[:TURN_TEXT_LIMIT]
+        values[4] = int(bool(values[4]))
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO call_turns (attempt_id, seq, role, kind, text, "
+                "interrupted, at_ms, speech_ms, stt_ms, llm_ms, tts_ms, response_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, *values, iso(self.now())),
+            )
+
+    def transcript(self, attempt_id: int) -> list[dict[str, Any]]:
+        with self.db.connect(must_exist=True) as conn:
+            self._attempt(conn, attempt_id)
+            rows = conn.execute(_TRANSCRIPT_SQL, (attempt_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_transcript(self, attempt_id: int, *, actor: str = "cli") -> int:
+        with self.db.transaction() as conn:
+            self._attempt(conn, attempt_id)
+            removed = conn.execute(
+                "DELETE FROM call_turns WHERE attempt_id = ?", (attempt_id,)
+            ).rowcount
+            self.db.audit(
+                "call.transcript.delete",
+                actor=actor[:50],
+                subject=f"attempt:{attempt_id}",
+                details={"turns": removed},
+                conn=conn,
+            )
+        return removed
+
+    def prune_turns(self, *, days: int) -> int:
+        cutoff = iso(self.now() - timedelta(days=days))
+        with self.db.transaction() as conn:
+            return conn.execute("DELETE FROM call_turns WHERE created_at < ?", (cutoff,)).rowcount
+
+    def record_conversation(
+        self, attempt_id: int, *, voice_end: str, opt_out: bool, caller_turns: int
+    ) -> None:
+        """How the conversation ended. Usually stored before the call ends (the result then
+        includes it); when the person hung up first, the result is completed here."""
+        now = self.now()
+        now_s = iso(now)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE call_attempts SET voice_end = COALESCE(voice_end, ?), "
+                "opt_out = MAX(opt_out, ?), voice_turns = ?, updated_at = ? WHERE id = ?",
+                (voice_end, int(opt_out), caller_turns, now_s, attempt_id),
+            )
+            attempt = self._attempt(conn, attempt_id)
+            self.db.audit(
+                "call.voice.end",
+                subject=f"attempt:{attempt_id}",
+                details={
+                    "voice_end": voice_end,
+                    "opt_out": bool(opt_out),
+                    "caller_turns": caller_turns,
+                },
+                conn=conn,
+            )
+            state = CallState(attempt["state"])
+            if attempt["kind"] != "job" or state not in TERMINAL_STATES:
+                return
+            duration = 0.0
+            if state == CallState.COMPLETED and attempt["answered_at"] and attempt["ended_at"]:
+                duration = (
+                    parse_iso(attempt["ended_at"]) - parse_iso(attempt["answered_at"])
+                ).total_seconds()
+            conn.execute(
+                "UPDATE call_results SET outcome = ?, summary = ? WHERE job_id = ? AND "
+                "attempt = ? AND notion_page_id IS NULL",
+                (
+                    _outcome(state, bool(attempt["opt_out"])).value,
+                    result_summary(
+                        state,
+                        attempt["end_reason"],
+                        duration_s=max(0.0, duration),
+                        cause=attempt["hangup_cause"],
+                        cause_txt=attempt["hangup_cause_txt"],
+                        simulated=bool(attempt["simulated"]),
+                        voice_end=attempt["voice_end"],
+                        voice_turns=attempt["voice_turns"],
+                        opt_out=bool(attempt["opt_out"]),
+                    ),
+                    attempt["job_id"],
+                    attempt["attempt"],
+                ),
+            )
 
     # ------------------------------------------------------------------ real-call permits
 
@@ -840,3 +967,10 @@ class CallStore:
             )
             result.append(item)
         return result
+
+
+def _outcome(state: CallState, opt_out: bool) -> Outcome:
+    """A conversation in which the person asked not to be called again is a refusal."""
+    if opt_out and state == CallState.COMPLETED:
+        return Outcome.OPT_OUT
+    return OUTCOME_BY_STATE[state]
