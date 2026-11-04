@@ -243,4 +243,37 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=4,
+        name="voice_conversations",
+        statements=(
+            # How the conversation of an answered call ended (voice mode), whether the person
+            # asked not to be called again, and how many times they spoke.
+            "ALTER TABLE call_attempts ADD COLUMN voice_end TEXT",
+            "ALTER TABLE call_attempts ADD COLUMN opt_out INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE call_attempts ADD COLUMN voice_turns INTEGER",
+            # The transcript: one row per phrase, with the time it took to answer. Kept for
+            # WEWLN_VOICE_TRANSCRIPT_DAYS, then deleted.
+            """
+            CREATE TABLE call_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER NOT NULL REFERENCES call_attempts (id),
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('assistant', 'caller')),
+                kind TEXT NOT NULL,
+                text TEXT NOT NULL,
+                interrupted INTEGER NOT NULL DEFAULT 0,
+                at_ms INTEGER NOT NULL,
+                speech_ms INTEGER,
+                stt_ms INTEGER,
+                llm_ms INTEGER,
+                tts_ms INTEGER,
+                response_ms INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE (attempt_id, seq)
+            )
+            """,
+            "CREATE INDEX idx_call_turns_created ON call_turns (created_at)",
+        ),
+    ),
 )

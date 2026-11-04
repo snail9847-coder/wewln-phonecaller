@@ -37,6 +37,14 @@ sudo asterisk -rx "core set verbose 3" || true
 sudo asterisk -rx "pjsip show endpoints" | grep -E "softphone|wewln-trunk"
 sudo asterisk -rx "dialplan show wewln-ci" | grep -c "994124980"
 sudo asterisk -rx "dialplan show wewln-softphone" | grep "600"
+# Call audio for the voice engine: AudioSocket (externalMedia) and a mixing bridge.
+sudo asterisk -rx "module show like audiosocket"
+for module in chan_audiosocket.so res_audiosocket.so bridge_softmix.so; do
+  if ! sudo asterisk -rx "module show like $module" | grep -q "$module"; then
+    echo "$module is not loaded (needed for voice calls)" >&2
+    exit 1
+  fi
+done
 if sudo asterisk -rx "module show like chan_sip.so" | grep -q "chan_sip.so"; then
   echo "chan_sip is loaded although modules.conf says noload" >&2
   exit 1

@@ -75,6 +75,14 @@ HANGUP_UNCONFIRMED = "hangup_unconfirmed"
 INTERRUPTED = "interrupted"
 # The check right before the dial request found the real call no longer permitted.
 REAL_CALLS_BLOCKED = "real_calls_blocked"
+# How a conversation of the voice engine ended (also the end reason when wewln hung up).
+CONVERSATION_END = "conversation_end"
+OPT_OUT = "opt_out"
+NO_INPUT = "no_input"
+MAX_TURNS = "max_turns"
+VOICE_ERROR = "voice_error"
+CALLER_HANGUP = "caller_hangup"
+MEDIA_LOST = "media_lost"
 
 # Failures after which repeating the attempt cannot help.
 NON_RETRYABLE_FAILURES = frozenset({"provider_rejected", "provider_refused", "provider_uncertain"})
@@ -200,6 +208,13 @@ _END_TEXT = {
     "provider_uncertain": "нет ответа от провайдера: звонок мог начаться, повтор не делался",
     REAL_CALLS_BLOCKED: "реальный звонок больше не разрешён: номер не набирался",
     "ended_before_ringing": "звонок прервался до вызова",
+    CONVERSATION_END: "ассистент завершил разговор",
+    OPT_OUT: "собеседник попросил больше не звонить",
+    NO_INPUT: "собеседник не отвечал",
+    MAX_TURNS: "разговор завершён по лимиту реплик",
+    VOICE_ERROR: "сбой голосового движка, звонок завершён",
+    CALLER_HANGUP: "собеседник положил трубку",
+    MEDIA_LOST: "пропал звук звонка",
 }
 
 
@@ -211,12 +226,21 @@ def result_summary(
     cause: int | None,
     cause_txt: str | None,
     simulated: bool,
+    voice_end: str | None = None,
+    voice_turns: int | None = None,
+    opt_out: bool = False,
 ) -> str:
     """The «Итог» text of a result (Russian, no personal data)."""
     parts = [STATE_LABELS[state]]
     detail = _END_TEXT.get(end_reason or "")
     if detail:
         parts.append(detail)
+    if voice_end and voice_end != end_reason and voice_end in _END_TEXT:
+        parts.append("разговор: " + _END_TEXT[voice_end])
+    if voice_turns is not None:
+        parts.append(f"реплик собеседника: {voice_turns}")
+    if opt_out and end_reason != OPT_OUT and voice_end != OPT_OUT:
+        parts.append("просил больше не звонить")
     if state == CallState.COMPLETED:
         parts.append(f"длительность {round(duration_s)} с")
     if cause is not None and state not in (CallState.COMPLETED, CallState.CANCELLED):
