@@ -13,6 +13,7 @@ import getpass
 import io
 import logging
 import os
+import secrets
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -25,19 +26,34 @@ from . import __version__
 from .api import create_app
 from .config import (
     ENV_PREFIX,
+    MIN_WEBHOOK_SECRET_LENGTH,
+    MOCK_SCENARIOS,
     Settings,
     check_notion_token_format,
+    check_secret_format,
     find_unknown_variables,
     load_settings,
 )
 from .domain import CampaignStatus, reason_label
-from .errors import ConfigError, StorageError, WewlnError
+from .errors import ConfigError, RealCallsBlockedError, StorageError, WewlnError
 from .logging_setup import setup_logging, shutdown_logging
+from .phones import describe_number, dial_policy_problem, normalize_phone
 from .redact import mask_phone_numbers
 from .safety import evaluate_real_calls
-from .secret_store import NOTION_TOKEN_KEY, SecretStoreUnavailable, default_store
+from .secret_store import (
+    ARI_PASSWORD_KEY,
+    NOTION_TOKEN_KEY,
+    WEBHOOK_SECRET_KEY,
+    SecretStoreUnavailable,
+    default_store,
+)
 from .storage import Database
+from .storage.calls import CallStore
 from .storage.repository import ContactInput, Repository
+from .telephony import PROVIDERS
+from .telephony.factory import create_call_store, create_provider, create_repository
+from .telephony.lifecycle import STATE_LABELS, CallState
+from .telephony.service import CallOutcome, CallService
 
 log = logging.getLogger("wewln.cli")
 
@@ -87,11 +103,7 @@ def _quiet_logging(settings: Settings) -> None:
 def _repository(settings: Settings) -> Repository:
     db = Database(settings.resolved_db_path)
     db.migrate()
-    return Repository(
-        db,
-        default_language=settings.default_language,
-        default_region=settings.default_phone_region,
-    )
+    return create_repository(settings, db)
 
 
 def _with_repository(func: Callable[[argparse.Namespace, Settings, Repository], int]):
@@ -133,6 +145,12 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     if settings is None:
         return EXIT_CONFIG
     decision = evaluate_real_calls(settings)
+    problems = settings.provider_problems
+    if problems:
+        print("Configuration is invalid:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return EXIT_CONFIG
     print("Configuration is valid.")
     for key, value in settings.redacted_summary().items():
         print(f"  {key}: {value}")
@@ -194,11 +212,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     sync_service = None
     if settings.notion_enabled:
-        repo = Repository(
-            db,
-            default_language=settings.default_language,
-            default_region=settings.default_phone_region,
-        )
+        repo = create_repository(settings, db)
         sync_service = SyncService(
             NotionSync(settings, repo), interval=settings.notion_sync_interval
         )
@@ -665,6 +679,376 @@ def cmd_simulate(args: argparse.Namespace, settings: Settings, repo: Repository)
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------- telephony and calls
+
+SECRET_NAMES = {"ari-password": ARI_PASSWORD_KEY, "webhook-secret": WEBHOOK_SECRET_KEY}
+
+
+def cmd_telephony_secret_set(args: argparse.Namespace) -> int:
+    key = SECRET_NAMES[args.name]
+    if args.generate:
+        if args.name != "webhook-secret":
+            print("--generate is only for webhook-secret.", file=sys.stderr)
+            return EXIT_CONFIG
+        value = secrets.token_urlsafe(48)
+    elif args.stdin:
+        value = sys.stdin.readline().strip()
+    else:
+        value = getpass.getpass(f"Enter the {args.name} (input stays hidden), then Enter: ").strip()
+    try:
+        check_secret_format(value)
+        if args.name == "webhook-secret" and len(value) < MIN_WEBHOOK_SECRET_LENGTH:
+            raise ValueError(f"must be at least {MIN_WEBHOOK_SECRET_LENGTH} characters long")
+    except ValueError as exc:
+        print(f"The {args.name} was not saved: it {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    store = default_store()
+    try:
+        store.set(key, value)
+    except SecretStoreUnavailable as exc:
+        env = ENV_PREFIX + key.upper()
+        print(f"Not saved: {exc}. Set the {env} environment variable instead.", file=sys.stderr)
+        return EXIT_RUNTIME
+    print(f"The {args.name} is saved in the OS credential store ({store.name}).")
+    if args.generate and args.show:
+        print("Copy it into the sender's configuration now; it is not shown again:")
+        print(value)
+    if any(k.upper() == ENV_PREFIX + key.upper() for k in os.environ):
+        print(f"Note: {ENV_PREFIX + key.upper()} is set in the environment and takes precedence.")
+    return EXIT_OK
+
+
+def cmd_telephony_secret_delete(args: argparse.Namespace) -> int:
+    store = default_store()
+    try:
+        deleted = store.delete(SECRET_NAMES[args.name])
+    except SecretStoreUnavailable as exc:
+        print(f"Credential store unavailable: {exc}", file=sys.stderr)
+        return EXIT_RUNTIME
+    print(f"The {args.name} is deleted." if deleted else f"No {args.name} was stored.")
+    return EXIT_OK
+
+
+def cmd_telephony_secret_status(args: argparse.Namespace) -> int:
+    settings = _load(args.env_file)
+    if settings is None:
+        return EXIT_CONFIG
+    print(f"ari-password: {settings.ari_password_source}")
+    print(f"webhook-secret: {settings.webhook_secret_source}")
+    return EXIT_OK
+
+
+def cmd_telephony_check(args: argparse.Namespace) -> int:
+    settings = _load(args.env_file)
+    if settings is None:
+        return EXIT_CONFIG
+    _quiet_logging(settings)
+    if settings.provider_problems:
+        for problem in settings.provider_problems:
+            print(f"Problem: {problem}", file=sys.stderr)
+        return EXIT_CONFIG
+    provider = create_provider(settings)
+    result = asyncio.run(provider.check())
+    for key, value in result.items():
+        print(f"  {key}: {value}")
+    decision = evaluate_real_calls(settings)
+    blocked = ", ".join(r.value for r in decision.reasons)
+    print(
+        f"  real_calls_allowed: {decision.allowed}"
+        + (f" (blocked by: {blocked})" if blocked else "")
+    )
+    if result.get("status") != "ok":
+        print("Telephony check failed; see docs/ASTERISK.md (troubleshooting).", file=sys.stderr)
+        return EXIT_RUNTIME
+    print("Telephony check passed.")
+    return EXIT_OK
+
+
+def _calls_settings(args: argparse.Namespace, *, dialing: bool = False) -> Settings | None:
+    """Settings for the calls commands. Only dialing needs a working provider configuration:
+    the emergency stop, cancel and the lists always work."""
+    settings = _load(args.env_file)
+    if settings is None:
+        return None
+    if dialing and settings.provider_problems:
+        for problem in settings.provider_problems:
+            print(f"Problem: {problem}", file=sys.stderr)
+        return None
+    _quiet_logging(settings)
+    return settings
+
+
+def _store(settings: Settings) -> CallStore:
+    db = Database(settings.resolved_db_path)
+    db.migrate()
+    return create_call_store(settings, db)
+
+
+def _service(args: argparse.Namespace, settings: Settings, store: CallStore) -> CallService:
+    scenario = getattr(args, "scenario", None)
+    if scenario and settings.telephony_provider != "mock":
+        raise WewlnError("--scenario works only with the mock provider", code="invalid_input")
+    provider = create_provider(
+        settings, scenario=scenario, time_scale=0.0 if getattr(args, "fast", False) else 1.0
+    )
+    return CallService(settings, store, provider)
+
+
+def _outcome_line(outcome: CallOutcome) -> str:
+    cause = f", cause {outcome.cause}" if outcome.cause is not None else ""
+    error = f", error {outcome.error_code}" if outcome.error_code else ""
+    sim = " [simulated]" if outcome.simulated else ""
+    subject = f"job {outcome.job_id}" if outcome.job_id else f"test call {outcome.attempt_id}"
+    return (
+        f"  {subject}: {outcome.state.value} ({STATE_LABELS[outcome.state]})"
+        f" - {outcome.end_reason or ''}{cause}{error}{sim}"
+    )
+
+
+def _blocked(exc: RealCallsBlockedError) -> int:
+    print(f"Blocked: {exc.message}", file=sys.stderr)
+    blocked = exc.details.get("blocked_by") or []
+    hints = {
+        "simulation_mode": "WEWLN_MODE=production and WEWLN_PRODUCTION_CONFIRM are required",
+        "production_not_confirmed": "set WEWLN_PRODUCTION_CONFIRM=I_ACCEPT_REAL_CALLS",
+        "kill_switch_engaged": "the emergency stop is on (wewln calls resume)",
+        "provider_simulation_only": "the mock provider never places real calls",
+        "provider_not_configured": "configure the provider (docs/ASTERISK.md)",
+        "call_regions_not_set": "set WEWLN_CALL_REGIONS, e.g. AZ or RU",
+        "operator_not_armed": "a real call needs a permit: wewln calls permit --to <number>",
+    }
+    for reason in blocked:
+        print(f"  - {reason}: {hints.get(reason, '')}", file=sys.stderr)
+    return EXIT_RUNTIME
+
+
+def _precheck_real(settings: Settings, store: CallStore, *, armed: bool) -> None:
+    """The real-call gate before connecting to the provider (the service checks it again)."""
+    decision = evaluate_real_calls(
+        settings, operator_armed=armed, kill_switch_engaged=store.kill_switch() is not None
+    )
+    if not decision.allowed:
+        raise RealCallsBlockedError(
+            "Real calls are blocked: " + ", ".join(r.value for r in decision.reasons),
+            details=decision.as_dict(),
+        )
+
+
+def cmd_calls_run(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args, dialing=True)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+
+    async def run() -> Any:
+        async with _service(args, settings, store) as service:
+            return await service.run_jobs(limit=args.limit, campaign_id=args.campaign)
+
+    try:
+        if PROVIDERS[settings.telephony_provider].places_real_calls:
+            print(
+                "Campaign calls over a real provider are not enabled in this version "
+                "(Phase 6 adds arming, schedules and limits). Use the mock provider, or "
+                "`wewln calls test` for a single test call.",
+                file=sys.stderr,
+            )
+            _precheck_real(settings, store, armed=False)
+        report = asyncio.run(run())
+    except RealCallsBlockedError as exc:
+        return _blocked(exc)
+    except KeyboardInterrupt:
+        print("Interrupted: calls in progress were ended.", file=sys.stderr)
+        return 130
+    simulated = all(o.simulated for o in report.outcomes)
+    print(
+        f"Calls placed: {report.placed}"
+        + (" (mock provider: simulated, no real call)." if simulated else ".")
+    )
+    for outcome in report.outcomes:
+        print(_outcome_line(outcome))
+    if report.stopped_by:
+        print(
+            f"Stopped early: {report.stopped_by}" + (f" ({report.error})" if report.error else "")
+        )
+    if settings.notion_enabled:
+        print("Results reach Notion on the next sync (wewln notion sync, or wewln serve).")
+    return EXIT_OK if report.stopped_by in (None, "kill_switch") else EXIT_RUNTIME
+
+
+def _number(settings: Settings, raw: str) -> str | None:
+    normalized = normalize_phone(raw, settings.default_phone_region)
+    if normalized.e164 is None:
+        print(f"The number is rejected ({normalized.error}).", file=sys.stderr)
+        return None
+    return normalized.e164
+
+
+def cmd_calls_test(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args, dialing=True)
+    if settings is None:
+        return EXIT_CONFIG
+    to = None
+    if not args.softphone:
+        to = _number(settings, args.to)
+        if to is None:
+            return EXIT_CONFIG
+    store = _store(settings)
+    if to is not None and PROVIDERS[settings.telephony_provider].places_real_calls:
+        try:
+            _precheck_real(settings, store, armed=store.has_valid_permit(to))
+        except RealCallsBlockedError as exc:
+            return _blocked(exc)
+
+    async def run() -> CallOutcome:
+        async with _service(args, settings, store) as service:
+            if args.softphone:
+                print(
+                    f"Test call to the local softphone {settings.asterisk_softphone_endpoint} "
+                    "(no phone network)" + (" [simulated]" if service.simulated else "") + "..."
+                )
+            else:
+                kind = "simulated" if service.simulated else "REAL"
+                print(f"{kind} test call to {mask_phone_numbers(to or '')}...")
+            return await service.test_call(to_e164=to, softphone=args.softphone)
+
+    try:
+        outcome = asyncio.run(run())
+    except RealCallsBlockedError as exc:
+        return _blocked(exc)
+    except KeyboardInterrupt:
+        print("Interrupted: the call was ended.", file=sys.stderr)
+        return 130
+    print(_outcome_line(outcome))
+    return EXIT_OK
+
+
+def cmd_calls_permit(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    to = _number(settings, args.to)
+    if to is None:
+        return EXIT_CONFIG
+    problem = dial_policy_problem(to, settings.allowed_call_regions)
+    if problem is not None:
+        print(f"This number may not be called ({problem}).", file=sys.stderr)
+        return EXIT_CONFIG
+    info = describe_number(to)
+    masked = mask_phone_numbers(to)
+    print(
+        f"Permit ONE real call to {masked} (country {info.region if info else '?'}, "
+        f"type {info.kind if info else '?'}) within {args.minutes} minutes."
+    )
+    print("The call is real: it reaches a phone and may cost money at your SIP provider.")
+    confirm = args.confirm
+    if confirm is None:
+        confirm = input("Type the last 4 digits of the number to confirm: ").strip()
+    if confirm != to[-4:]:
+        print("Not confirmed; no permit was created.", file=sys.stderr)
+        return EXIT_RUNTIME
+    store = _store(settings)
+    permit = store.create_permit(to, minutes=args.minutes, created_by="cli")
+    print(f"Permit {permit['id']} is valid until {permit['expires_at']} (UTC), for one call.")
+    decision = evaluate_real_calls(
+        settings, operator_armed=True, kill_switch_engaged=store.kill_switch() is not None
+    )
+    if decision.allowed:
+        print("Everything else is ready: wewln calls test --to <the number>")
+    else:
+        print("Still blocked by: " + ", ".join(r.value for r in decision.reasons))
+    return EXIT_OK
+
+
+def cmd_calls_permits(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+    if args.revoke:
+        print(f"Revoked {store.revoke_permits()} permit(s).")
+        return EXIT_OK
+    rows = [
+        [
+            p["id"],
+            _phone(p["phone_e164"], args.unmask),
+            f"{p['used']}/{p['max_calls']}",
+            p["expires_at"],
+            "yes" if p["valid"] else "",
+        ]
+        for p in store.list_permits()
+    ]
+    _table(rows, ["id", "phone", "used", "expires (UTC)", "valid"])
+    return EXIT_OK
+
+
+def cmd_calls_list(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+    rows = [
+        [
+            a["id"],
+            a["kind"],
+            a["campaign_name"] or "",
+            a["phone_masked"] or a["target"],
+            STATE_LABELS[CallState(a["state"])],
+            a["end_reason"] or "",
+            a["hangup_cause"] if a["hangup_cause"] is not None else "",
+            "yes" if a["simulated"] else "",
+            a["created_at"],
+        ]
+        for a in store.list_attempts(limit=args.limit, active_only=args.active)
+    ]
+    _table(
+        rows,
+        ["id", "kind", "campaign", "phone", "state", "reason", "cause", "simulated", "created"],
+    )
+    kill = store.kill_switch()
+    if kill:
+        print(f"Emergency stop is ON (since {kill['updated_at']}, by {kill['source']}).")
+    return EXIT_OK
+
+
+def cmd_calls_cancel(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+    store.get_attempt(args.attempt_id)
+    if store.request_cancel(args.attempt_id):
+        print("Cancel requested: the running dialer ends the call within a few seconds.")
+    else:
+        print("The call is not in progress.")
+    return EXIT_OK
+
+
+def cmd_calls_stop_all(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+    engaged = store.engage_kill_switch(source="cli", reason=args.reason or "")
+    active = len(store.list_attempts(active_only=True))
+    print(
+        "Emergency stop " + ("engaged" if engaged else "was already engaged") + f": {active} "
+        "call(s) in progress are ended by the dialer; nothing is dialed until `wewln calls resume`."
+    )
+    return EXIT_OK
+
+
+def cmd_calls_resume(args: argparse.Namespace) -> int:
+    settings = _calls_settings(args)
+    if settings is None:
+        return EXIT_CONFIG
+    store = _store(settings)
+    released = store.release_kill_switch(source="cli")
+    print("Emergency stop released." if released else "The emergency stop was not engaged.")
+    if settings.kill_switch:
+        print("Note: WEWLN_KILL_SWITCH=true still blocks every call.")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------- parser
 
 
@@ -771,6 +1155,66 @@ def build_parser() -> argparse.ArgumentParser:
     d_list = dnc_sub.add_parser("list", help="the list (phone numbers masked)")
     d_list.add_argument("--unmask", action="store_true", help="show full phone numbers")
     d_list.set_defaults(func=cmd_dnc_list)
+
+    telephony = sub.add_parser("telephony", help="telephony provider: check and secrets")
+    t_sub = telephony.add_subparsers(dest="telephony_command", required=True)
+    t_sub.add_parser("check", help="check the provider (Asterisk: ARI, app, trunk)").set_defaults(
+        func=cmd_telephony_check
+    )
+    t_secret = t_sub.add_parser("secret", help="ARI password / webhook secret in the OS store")
+    ts_sub = t_secret.add_subparsers(dest="secret_command", required=True)
+    ts_set = ts_sub.add_parser("set", help="save a secret (asked without echo)")
+    ts_set.add_argument("name", choices=sorted(SECRET_NAMES))
+    ts_set.add_argument("--stdin", action="store_true", help="read the value from stdin")
+    ts_set.add_argument("--generate", action="store_true", help="webhook-secret: generate one")
+    ts_set.add_argument("--show", action="store_true", help="with --generate: print it once")
+    ts_set.set_defaults(func=cmd_telephony_secret_set)
+    ts_delete = ts_sub.add_parser("delete", help="remove a stored secret")
+    ts_delete.add_argument("name", choices=sorted(SECRET_NAMES))
+    ts_delete.set_defaults(func=cmd_telephony_secret_delete)
+    ts_sub.add_parser("status", help="where each secret comes from (never shows it)").set_defaults(
+        func=cmd_telephony_secret_status
+    )
+
+    calls = sub.add_parser("calls", help="dial, watch, cancel and stop calls")
+    calls_sub = calls.add_subparsers(dest="calls_command", required=True)
+    l_run = calls_sub.add_parser("run", help="call queued jobs one at a time (mock: simulated)")
+    l_run.add_argument("--campaign", type=int)
+    l_run.add_argument("--limit", type=int, default=10)
+    l_run.add_argument("--scenario", choices=MOCK_SCENARIOS, help="mock provider scenario")
+    l_run.add_argument("--fast", action="store_true", help="mock provider: no waiting")
+    l_run.set_defaults(func=cmd_calls_run)
+    l_test = calls_sub.add_parser("test", help="one test call to a number or the softphone")
+    target = l_test.add_mutually_exclusive_group(required=True)
+    target.add_argument("--to", help="phone number (+994..., +7...)")
+    target.add_argument(
+        "--softphone", action="store_true", help="call the local softphone (no phone network)"
+    )
+    l_test.add_argument("--scenario", choices=MOCK_SCENARIOS, help="mock provider scenario")
+    l_test.add_argument("--fast", action="store_true", help="mock provider: no waiting")
+    l_test.set_defaults(func=cmd_calls_test)
+    l_permit = calls_sub.add_parser("permit", help="allow ONE real test call to a number")
+    l_permit.add_argument("--to", required=True, help="phone number (+994..., +7...)")
+    l_permit.add_argument("--minutes", type=int, default=15, help="validity, 1-60 (default 15)")
+    l_permit.add_argument("--confirm", help="the last 4 digits (instead of the prompt)")
+    l_permit.set_defaults(func=cmd_calls_permit)
+    l_permits = calls_sub.add_parser("permits", help="real-call permits")
+    l_permits.add_argument("--revoke", action="store_true", help="revoke every unused permit")
+    l_permits.add_argument("--unmask", action="store_true", help="show full phone numbers")
+    l_permits.set_defaults(func=cmd_calls_permits)
+    l_list = calls_sub.add_parser("list", help="recent calls (phone numbers masked)")
+    l_list.add_argument("--active", action="store_true", help="only calls in progress")
+    l_list.add_argument("--limit", type=int, default=30)
+    l_list.set_defaults(func=cmd_calls_list)
+    l_cancel = calls_sub.add_parser("cancel", help="end one call in progress")
+    l_cancel.add_argument("attempt_id", type=int)
+    l_cancel.set_defaults(func=cmd_calls_cancel)
+    l_stop = calls_sub.add_parser("stop-all", help="EMERGENCY STOP: end all calls, dial nothing")
+    l_stop.add_argument("--reason")
+    l_stop.set_defaults(func=cmd_calls_stop_all)
+    calls_sub.add_parser("resume", help="release the emergency stop").set_defaults(
+        func=cmd_calls_resume
+    )
 
     simulate = sub.add_parser("simulate", help="complete queued jobs with simulated calls")
     simulate.add_argument("--campaign", type=int)
