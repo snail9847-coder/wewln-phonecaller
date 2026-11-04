@@ -34,6 +34,8 @@ class SimulatedCaller:
     frame_s: float = 0.02
     # The assistant's silence after which the caller speaks.
     pause_ms: int = 1500
+    # The assistant's silence after the last phrase before hanging up (None: pause_ms).
+    hangup_pause_ms: int | None = None
     # How long the caller waits for the assistant to start, and to answer, at most.
     patience_s: float = 20.0
     hangup_after: bool = True
@@ -89,7 +91,10 @@ class SimulatedCaller:
                 else:
                     frame = silence
                     waited_ms += FRAME_MS
-                    ready = (assistant_spoke and quiet_ms >= self.pause_ms) or (
+                    pause_ms = self.pause_ms
+                    if not queue and self.hangup_pause_ms is not None:
+                        pause_ms = self.hangup_pause_ms
+                    ready = (assistant_spoke and quiet_ms >= pause_ms) or (
                         waited_ms >= self.patience_s * 1000
                     )
                     if ready and not got:

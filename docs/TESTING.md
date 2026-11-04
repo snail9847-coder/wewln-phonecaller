@@ -17,7 +17,7 @@ Linux: те же команды через `.venv/bin/python`.
 API (`notion/mock_server.py`) на `127.0.0.1`, Asterisk — имитацией ARI (`tests/ari_simulator.py`):
 HTTP и WebSocket, события звонков, ошибки и обрывы связи. Тесты с настоящим Asterisk
 (`tests/test_asterisk_live.py`) и с настоящими моделями (`tests/test_voice_models.py`) без них
-пропускаются: `477 passed, 15 skipped`. Каждый тест работает во временной папке,
+пропускаются: `479 passed, 15 skipped`. Каждый тест работает во временной папке,
 переменные `WEWLN_*` с компьютера в тесты не попадают, настоящее хранилище учётных данных
 Windows не используется (его заменяет хранилище в памяти).
 

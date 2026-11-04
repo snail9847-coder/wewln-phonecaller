@@ -206,8 +206,9 @@ async def test_live_asterisk_reaches_the_audio_socket(live_voice):
 
 
 async def test_live_voice_call_hears_the_person(live_voice):
-    # The far end says "hello world" (Asterisk's sound file) after wewln's greeting.
-    w = live_voice(heard=["hello world"], replies=["Спасибо, до свидания! [END]"])
+    # The far end says "hello world" (Asterisk's sound file) 3 s after answering, a bit
+    # after wewln's greeting; no_input_s is longer than that pause, so there is no reprompt.
+    w = live_voice(heard=["hello world"], replies=["Спасибо, до свидания! [END]"], no_input_s=8.0)
     async with w.service:
         outcome = await call(w.service, SPEAKS)
     kinds = [t["kind"] for t in w.store.transcript(outcome.attempt_id)]
