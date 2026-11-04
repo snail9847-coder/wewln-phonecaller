@@ -9,6 +9,8 @@ Call audio as in Asterisk 20-22: mixing bridges, `POST /channels/externalMedia` 
 AudioSocket encapsulation really connects over TCP to the given host:port and sends the UUID
 first (as chan_audiosocket does, during the request), and `GET /asterisk/modules/{name}`.
 Once a call and its audio channel are bridged, `media_person` is the person on the line.
+`drop_media` hangs up an audio channel while its call stays up, as Asterisk 22.5 sometimes
+does; the person stays on the line and hears wewln again once a new audio channel joins.
 """
 
 from __future__ import annotations
@@ -66,6 +68,48 @@ class Channel:
     task: asyncio.Task[None] | None = None
 
 
+class PersonLine(MediaStream):
+    """The person's end of a call's audio. It outlives the audio channel: after drop_media the
+    person waits on the same line until wewln's new audio channel joins the bridge."""
+
+    def __init__(self, connection: AudioSocketConnection) -> None:
+        self.connection = connection
+        self._changed = asyncio.Event()
+        self._ended = False
+        self.closed_here = False  # the person hung up
+
+    @property
+    def closed(self) -> bool:
+        return self._ended or self.closed_here
+
+    def switch(self, connection: AudioSocketConnection) -> None:
+        self.connection = connection
+        self._changed.set()
+
+    def end(self) -> None:
+        self._ended = True
+        self._changed.set()
+
+    async def read(self) -> bytes | None:
+        while True:
+            connection = self.connection
+            chunk = await connection.read()
+            if chunk is not None:
+                return chunk
+            while self.connection is connection and not self.closed:
+                self._changed.clear()
+                await self._changed.wait()
+            if self.closed:
+                return None
+
+    async def write(self, pcm: bytes) -> None:
+        await self.connection.write(pcm)  # lost while there is no audio channel
+
+    async def close(self) -> None:
+        self.closed_here = True
+        await self.connection.close()
+
+
 @dataclass
 class AriSimulator:
     username: str = "wewln"
@@ -104,6 +148,9 @@ class AriSimulator:
         self.media: dict[str, AudioSocketConnection] = {}
         self.media_connects = 0
         self.persons: dict[str, asyncio.Task[None]] = {}
+        self.lines: dict[str, PersonLine] = {}
+        self.media_drops = 0
+        self._dropping: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
 
@@ -130,9 +177,12 @@ class AriSimulator:
     async def _destroy(self, channel: Channel, cause: int, cause_txt: str, tech: int | None):
         if self.channels.pop(channel.id, None) is None:
             return
-        for members in self.bridges.values():
+        for bridge_id, members in self.bridges.items():
             if channel.id in members:
                 members.remove(channel.id)
+                person = self.lines.get(bridge_id)
+                if person is not None and channel.id not in self._dropping:
+                    person.end()
         line = self.media.pop(channel.id, None)
         if line is not None:
             await line.close()
@@ -414,16 +464,30 @@ class AriSimulator:
         lines = [m for m in members if m in self.media]
         calls = [m for m in members if m not in self.media]
         if lines and calls and bridge_id not in self.persons:
-            task = asyncio.create_task(self._person(self.media[lines[0]], self.channels[calls[0]]))
+            person = PersonLine(self.media[lines[0]])
+            self.lines[bridge_id] = person
+            task = asyncio.create_task(self._person(person, self.channels[calls[0]]))
             self.persons[bridge_id] = task
+        elif lines and bridge_id in self.lines:
+            self.lines[bridge_id].switch(self.media[lines[-1]])  # a new audio channel
         return web.Response(status=204)
+
+    async def drop_media(self, channel_id: str) -> None:
+        """The audio channel hangs up on its own and closes its connection; the call stays."""
+        channel = self.channels[channel_id]
+        self._dropping.add(channel_id)
+        try:
+            self.media_drops += 1
+            await self._destroy(channel, 16, "Normal Clearing", None)
+        finally:
+            self._dropping.discard(channel_id)
 
     async def delete_bridge(self, request: web.Request) -> web.Response:
         if self.bridges.pop(request.match_info["id"], None) is None:
             return web.json_response({"message": "Bridge not found"}, status=404)
         return web.Response(status=204)
 
-    async def _person(self, line: AudioSocketConnection, call: Channel) -> None:
+    async def _person(self, line: PersonLine, call: Channel) -> None:
         if self.media_person is None:
             while await line.read() is not None:
                 pass

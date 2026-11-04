@@ -24,6 +24,7 @@ Asterisk, статусы звонков, аварийную остановку �
 | SIP-транк, звонки в телефонную сеть +7 и +994 | **не проверено**: нужен аккаунт у провайдера и отдельное разрешение владельца |
 | Софтфон MicroSIP на Windows с Asterisk в WSL2 | **[не проверено]**: инструкция ниже составлена по документации, на Windows не запускалась |
 | Звук звонка для голосового движка (AudioSocket, мост, externalMedia) | автотесты с имитацией ARI и настоящим TCP; CI с настоящим Asterisk 20 и 22: Asterisk проигрывает запись в звонок — wewln слышит и отвечает; эхо возвращает голос wewln |
+| Новый звуковой канал, когда Asterisk обрывает старый (ошибка 22.5.2, см. «Требования») | автотест с имитацией ARI: разговор продолжается и заканчивается как обычно; после 5 обрывов звонок завершается |
 | AudioSocket между Asterisk в WSL2 и wewln в Windows (сеть NAT или mirrored, брандмауэр) | **[не проверено]**: в CI Asterisk и wewln на одной машине |
 
 ## Требования
@@ -39,6 +40,16 @@ Asterisk, статусы звонков, аварийную остановку �
 | --- | --- | --- |
 | **26.04 LTS (рекомендуется)** | 22.5.2 | 22 LTS: исправления до 16.10.2028, исправления безопасности до 16.10.2029 |
 | 24.04 LTS | 20.6.0 | 20 LTS: с 19.10.2026 только исправления безопасности, конец поддержки 19.10.2027 |
+
+**Ошибка AudioSocket в Asterisk 22.5.2 (Ubuntu 26.04).** В версиях 20.14–20.16 и 22.4–22.6
+Asterisk иногда сам обрывает звуковой канал посреди звонка (в журнале Asterisk:
+`Failed to read header from AudioSocket because: Resource temporarily unavailable`);
+исправлено в 20.17, 22.7 и 23.1 ([коммит](https://github.com/asterisk/asterisk/commit/797902effc3d16b7be8eba782cb8c1a5db39e4aa)). Сам звонок при этом не
+прерывается: wewln подключает к нему новый звуковой канал, и человек слышит паузу около
+0,3 с (в журнале wewln: `call_media_dropped_by_asterisk`, затем `call_media_reconnected`; не
+больше 5 раз за звонок, дальше звонок завершается с причиной `media_lost`). В CI это случилось в одном
+голосовом звонке из нескольких. В Asterisk 20.6.0 (Ubuntu 24.04) этой ошибки нет: если паузы
+мешают, используйте Ubuntu 24.04.
 
 ## Шаг 1. WSL2 и Ubuntu
 
@@ -324,6 +335,7 @@ wewln calls test --to +994XXXXXXXXX
 | звонок `failed`, причина `provider_refused` | провайдер ответил SIP 401/402/403/407: логин, баланс или запрет направления | проверьте настройки и баланс у провайдера |
 | `Asterisk could not connect the call audio …` (HTTP 4xx/5xx) | нет модуля AudioSocket или Asterisk не достаёт адрес | `module show like audiosocket`; адрес в `WEWLN_VOICE_AUDIOSOCKET_HOST` / `_ADVERTISE` (шаг 6а) |
 | `Asterisk did not connect to … for the call audio` | брандмауэр Windows или неверный адрес | шаг 6а: адрес шлюза WSL, правило брандмауэра; в Ubuntu: `nc -vz <адрес> 9092` |
+| паузы в разговоре, в журнале `call_media_dropped_by_asterisk`; причина `media_lost` | ошибка AudioSocket в Asterisk 22.5.2 (см. «Требования»): wewln переподключает звук, но не больше 5 раз за звонок | Ubuntu 24.04 (Asterisk 20.6.0) или Asterisk 22.7 и новее |
 | причина `state_lost` или `hangup_unconfirmed` | wewln перезапустился во время звонка или Asterisk не подтвердил завершение | `sudo asterisk -rx "core show channels"`; повисший канал: `channel request hangup <имя>` |
 
 ## Как wewln понимает, чем закончился звонок
