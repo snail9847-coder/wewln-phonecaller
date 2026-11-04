@@ -168,7 +168,10 @@ wewln telephony check
 5. В PowerShell: `wewln calls test --softphone`. MicroSIP зазвонит. Ответьте: прозвучит
    «Hello world», wewln положит трубку и напечатает `completed`.
 
-Если звонок есть, а звука нет, разрешите MicroSIP в брандмауэре Windows.
+Если MicroSIP не регистрируется или не звонит либо звонок есть, а звука нет, разрешите MicroSIP
+в брандмауэре Windows для частных **и** общественных сетей: сеть WSL2 Windows обычно считает
+общественной. Windows спрашивает об этом при первом запуске MicroSIP, позже — «Брандмауэр
+Защитника Windows» → «Разрешение взаимодействия с приложением или компонентом».
 
 ## Шаг 7. Подключение SIP-провайдера
 
@@ -255,6 +258,7 @@ wewln calls test --to +994XXXXXXXXX
 | `the trunk endpoint does not exist` | имя транка не совпадает | `pjsip show endpoints`; имя в `WEWLN_ASTERISK_ENDPOINT` |
 | `Asterisk refused the call request (HTTP 400)` | неверная строка набора | проверьте `WEWLN_ASTERISK_ENDPOINT` |
 | `Asterisk ARI error (HTTP 500)` | Asterisk не смог создать канал: например, нет такого endpoint | `pjsip show endpoints`, `WEWLN_ASTERISK_SOFTPHONE_ENDPOINT` |
+| `Asterisk ARI did not answer to the call request` или причина `provider_uncertain` | ответ на запрос набора не пришёл (тайм-аут, обрыв связи, Ctrl+C), и неизвестно, начался ли звонок | wewln этот номер в этой попытке не повторяет и кладёт трубку, если звонок найдётся; проверьте `sudo asterisk -rx "core show channels"` и `wewln calls list` |
 | `another program took over the ARI application` | второй wewln или другая программа с тем же `WEWLN_ARI_APP` | остановите её и запустите wewln снова |
 | звонок `failed`, причина `provider_refused` | провайдер ответил SIP 401/402/403/407: логин, баланс или запрет направления | проверьте настройки и баланс у провайдера |
 | причина `state_lost` или `hangup_unconfirmed` | wewln перезапустился во время звонка или Asterisk не подтвердил завершение | `sudo asterisk -rx "core show channels"`; повисший канал: `channel request hangup <имя>` |
