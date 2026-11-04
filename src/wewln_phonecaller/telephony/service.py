@@ -326,6 +326,11 @@ class CallService:
         """Ask the provider to end a call; the reason is stored first."""
         if not await asyncio.to_thread(self.store.request_hangup, attempt["id"], reason):
             return
+        if attempt["id"] in self._placing:
+            # The dial request is on its way and the provider may not know the call yet:
+            # _place hangs up as soon as the request returns.
+            log.info("call_hangup_deferred", extra={"attempt_id": attempt["id"], "reason": reason})
+            return
         log.info("call_hangup", extra={"attempt_id": attempt["id"], "reason": reason})
         try:
             known = await self.provider.hangup(attempt["provider_call_id"])
@@ -336,7 +341,8 @@ class CallService:
             return
         if not known:
             if attempt["id"] in self._placing:
-                # The dial request may still create the call: _place ends it when it returns.
+                # Sent just before the dial request, which may still create the call: _place
+                # ends it when the request returns.
                 return
             fresh = await asyncio.to_thread(self.store.get_attempt, attempt["id"])
             if CallState(fresh["state"]) not in TERMINAL_STATES:
@@ -372,6 +378,15 @@ class CallService:
         )
         self._placing.add(ticket.attempt_id)
         try:
+            # A stop may have come since the attempt was written: then nothing is dialed.
+            fresh = await asyncio.to_thread(self.store.get_attempt, ticket.attempt_id)
+            if fresh["end_request"] is not None or CallState(fresh["state"]) != CallState.PENDING:
+                await asyncio.to_thread(self.store.finish_without_event, ticket.attempt_id)
+                log.info(
+                    "call_not_placed",
+                    extra={"attempt_id": ticket.attempt_id, "reason": fresh["end_request"]},
+                )
+                return
             try:
                 await self.provider.place_call(request)
             except ProviderUncertainError as exc:
@@ -406,8 +421,8 @@ class CallService:
                     "target": ticket.target,
                 },
             )
-        # An emergency stop or a cancel while the request was on its way may have found no call
-        # to hang up yet: end the call now that it may exist.
+        # An emergency stop or a cancel while the request was on its way was only recorded
+        # (see _end): end the call now that it may exist.
         fresh = await asyncio.to_thread(self.store.get_attempt, ticket.attempt_id)
         if fresh["end_request"] is not None and CallState(fresh["state"]) not in TERMINAL_STATES:
             await self._end(fresh, fresh["end_request"])

@@ -1,7 +1,8 @@
 """Against a real Asterisk (the CI job `asterisk-live`): ARI requests, events and hangups.
 
-Calls go to Local channels of a test dialplan (deploy/asterisk/ci/extensions.conf), so no SIP
-and no phone network are involved. Run locally with a configured Asterisk:
+Calls go to Local channels of a test dialplan (deploy/asterisk/ci/extensions-ci.conf), so no
+SIP and no phone network are involved. Run locally with a configured Asterisk that has this
+dialplan (docs/TESTING.md):
 
     ASTERISK_LIVE_ARI_URL=http://127.0.0.1:8088 ASTERISK_LIVE_ARI_USER=wewln \
     ASTERISK_LIVE_ARI_PASSWORD=... pytest -m asterisk_live

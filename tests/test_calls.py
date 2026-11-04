@@ -140,6 +140,11 @@ def active(w):
     return w.store.list_attempts(active_only=True)
 
 
+def dialing(w):
+    """One call was placed (the provider took the request) and is still going."""
+    return [a["state"] for a in active(w)] == ["dialing"]
+
+
 async def test_mixed_calls_end_in_the_right_states(world):
     phones = ("+994501234560", "+994501234565", "+994501234567", "+994501234568", "+994501234569")
     w = world(*phones, scenario="mixed")
@@ -242,7 +247,7 @@ async def test_silent_call_ends_at_the_ring_timeout(world):
     w = world(PHONE, scenario="silent")
     async with w.service:
         task = asyncio.create_task(w.service.run_jobs())
-        await until(lambda: len(active(w)) == 1)
+        await until(lambda: dialing(w))
         w.clock.advance(w.settings.call_ring_timeout + 20)
         report = await asyncio.wait_for(task, 5)
     (outcome,) = report.outcomes
@@ -278,7 +283,7 @@ async def test_calls_are_ended_when_they_must_not_go_on(world, action, end_reaso
     w = world(PHONE, scenario="silent", max_attempts=3)
     async with w.service:
         task = asyncio.create_task(w.service.run_jobs())
-        await until(lambda: len(active(w)) == 1)
+        await until(lambda: dialing(w))
         attempt_id = active(w)[0]["id"]
         if action == "cancel":
             assert w.store.request_cancel(attempt_id) is True
@@ -316,7 +321,7 @@ async def test_emergency_stop_ends_calls_and_blocks_dialing(world):
     w = world(PHONE, PHONE_2, scenario="silent", max_attempts=2)
     async with w.service:
         task = asyncio.create_task(w.service.run_jobs(limit=10))
-        await until(lambda: len(active(w)) == 1)
+        await until(lambda: dialing(w))
         assert w.store.engage_kill_switch(source="test", reason="drill") is True
         report = await asyncio.wait_for(task, 5)
     assert report.stopped_by == "kill_switch"
@@ -349,6 +354,27 @@ async def test_emergency_stop_during_the_dial_request_still_ends_the_call(world)
     (outcome,) = report.outcomes
     assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
     assert provider.hangups == [call.call_id]
+    assert report.stopped_by == "kill_switch"
+
+
+async def test_a_stop_just_before_the_dial_request_dials_nothing(world, monkeypatch):
+    w = world(PHONE, max_attempts=2)
+    begin = w.store.begin_job_attempt
+
+    def begin_then_stop(**kwargs):
+        ticket = begin(**kwargs)
+        if ticket is not None:
+            # The sweeper saw an emergency stop between the attempt and the dial request.
+            w.store.engage_kill_switch(source="test", reason="drill")
+            w.store.request_hangup(ticket.attempt_id, "kill_switch")
+        return ticket
+
+    monkeypatch.setattr(w.store, "begin_job_attempt", begin_then_stop)
+    async with w.service:
+        report = await asyncio.wait_for(w.service.run_jobs(), 5)
+    (outcome,) = report.outcomes
+    assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
+    assert (w.provider.placed, w.provider.hangups) == ([], [])
     assert report.stopped_by == "kill_switch"
 
 
@@ -433,7 +459,7 @@ async def test_interrupted_run_ends_the_call(world):
     w = world(PHONE, scenario="silent", max_attempts=2)
     async with w.service:
         task = asyncio.create_task(w.service.run_jobs())
-        await until(lambda: len(active(w)) == 1)
+        await until(lambda: dialing(w))
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
