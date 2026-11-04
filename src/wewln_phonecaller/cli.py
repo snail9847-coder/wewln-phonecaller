@@ -1199,7 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
     l_permit.add_argument("--confirm", help="the last 4 digits (instead of the prompt)")
     l_permit.set_defaults(func=cmd_calls_permit)
     l_permits = calls_sub.add_parser("permits", help="real-call permits")
-    l_permits.add_argument("--revoke", action="store_true", help="revoke every unused permit")
+    l_permits.add_argument("--revoke", action="store_true", help="revoke every permit in force")
     l_permits.add_argument("--unmask", action="store_true", help="show full phone numbers")
     l_permits.set_defaults(func=cmd_calls_permits)
     l_list = calls_sub.add_parser("list", help="recent calls (phone numbers masked)")
