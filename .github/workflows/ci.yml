@@ -50,7 +50,14 @@ jobs:
         run: python -m ruff format --check .
 
       - name: Tests (pytest)
-        run: python -m pytest -q
+        # bash (Git Bash on Windows) -eo pipefail: a failure fails the step despite tee.
+        shell: bash
+        run: python -m pytest -q -rfE --tb=short 2>&1 | tee pytest.log
+
+      - name: Failure details as annotations (readable on the run page)
+        if: failure()
+        shell: bash
+        run: python .github/scripts/annotate.py pytest.log
 
       - name: CLI check-config
         run: python -m wewln_phonecaller check-config
@@ -89,7 +96,7 @@ jobs:
           ASTERISK_LIVE_ARI_URL: http://127.0.0.1:8088
           ASTERISK_LIVE_ARI_USER: wewln
         run: |
-          .venv/bin/python -m pytest -q -m asterisk_live -p no:cacheprovider -rfE --tb=short \
+          .venv/bin/python -m pytest -q -m asterisk_live -p no:cacheprovider -rA --tb=short \
             2>&1 | tee pytest-live.log
 
       - name: wewln telephony check against the live Asterisk
@@ -110,8 +117,12 @@ jobs:
               || sudo tail -n 60 /var/log/asterisk/messages 2>/dev/null || true
           } 2>&1 | tee asterisk.log
 
-      - name: Failure details as annotations (readable on the run page)
+      - name: Results as annotations (readable on the run page)
+        if: always()
+        run: python3 .github/scripts/annotate.py --notice pytest-live.log telephony-check.log
+
+      - name: Failure details as annotations
         if: failure()
         run: >-
-          python3 deploy/asterisk/ci/annotate.py
+          python3 .github/scripts/annotate.py
           setup.log pytest-live.log telephony-check.log asterisk.log
