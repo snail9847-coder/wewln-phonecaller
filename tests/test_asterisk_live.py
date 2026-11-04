@@ -10,9 +10,12 @@ dialplan (docs/TESTING.md):
 
 import asyncio
 import os
+import socket
+from types import SimpleNamespace
 
 import pytest
 
+from voice_fakes import fake_runtime, fast_config
 from wewln_phonecaller.config import PRODUCTION_CONFIRM_PHRASE
 from wewln_phonecaller.storage import Database
 from wewln_phonecaller.storage.calls import CallStore
@@ -22,6 +25,7 @@ from wewln_phonecaller.telephony.lifecycle import CallState
 from wewln_phonecaller.telephony.service import CallService
 
 URL = os.environ.get("ASTERISK_LIVE_ARI_URL", "")
+AUDIOSOCKET_HOST = os.environ.get("ASTERISK_LIVE_AUDIOSOCKET_HOST", "127.0.0.1")
 pytestmark = [
     pytest.mark.asterisk_live,
     pytest.mark.skipif(not URL, reason="no live Asterisk (set ASTERISK_LIVE_ARI_URL)"),
@@ -33,28 +37,68 @@ BUSY = "+994124980117"
 RINGING = "+994124980119"
 REJECT = "+994124980121"
 CONGESTION = "+994124980134"
+# Voice calls (call audio over AudioSocket): a person who says "hello world" after 3 s, and
+# an echo of wewln's own voice.
+SPEAKS = "+994124980150"
+ECHO = "+994124980151"
+
+
+def live_settings(make_settings, **overrides):
+    return make_settings(
+        mode="production",
+        production_confirm=PRODUCTION_CONFIRM_PHRASE,
+        telephony_provider="asterisk",
+        ari_url=URL,
+        ari_username=os.environ.get("ASTERISK_LIVE_ARI_USER", "wewln"),
+        ari_password=os.environ.get("ASTERISK_LIVE_ARI_PASSWORD", ""),
+        asterisk_endpoint="Local/{number}@wewln-ci",
+        asterisk_number_format="digits",
+        call_regions="AZ",
+        **overrides,
+    )
 
 
 @pytest.fixture
 def live(make_settings):
     def build(**overrides):
-        settings = make_settings(
-            mode="production",
-            production_confirm=PRODUCTION_CONFIRM_PHRASE,
-            telephony_provider="asterisk",
-            ari_url=URL,
-            ari_username=os.environ.get("ASTERISK_LIVE_ARI_USER", "wewln"),
-            ari_password=os.environ.get("ASTERISK_LIVE_ARI_PASSWORD", ""),
-            asterisk_endpoint="Local/{number}@wewln-ci",
-            asterisk_number_format="digits",
-            call_regions="AZ",
-            **overrides,
-        )
+        settings = live_settings(make_settings, **overrides)
         db = Database(settings.resolved_db_path)
         db.migrate()
         store = CallStore(create_repository(settings, db))
         service = CallService(settings, store, create_provider(settings), sweep_interval=0.1)
         return service
+
+    return build
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@pytest.fixture
+def live_voice(make_settings):
+    """A voice call service with fake models (real-time audio) against the live Asterisk."""
+
+    def build(*, heard=(), replies=(), **config):
+        settings = live_settings(
+            make_settings,
+            voice_mode="ai",
+            # Asterisk in WSL2 with NAT reaches Windows at the WSL adapter (docs/ASTERISK.md).
+            voice_audiosocket_host=AUDIOSOCKET_HOST,
+            voice_audiosocket_port=free_port(),
+        )
+        db = Database(settings.resolved_db_path)
+        db.migrate()
+        store = CallStore(create_repository(settings, db))
+        runtime = fake_runtime(
+            heard=heard, replies=replies, config=fast_config(frame_s=0.02, **config)
+        )
+        service = CallService(
+            settings, store, create_provider(settings), voice=runtime, sweep_interval=0.1
+        )
+        return SimpleNamespace(service=service, store=store, runtime=runtime)
 
     return build
 
@@ -149,3 +193,36 @@ async def test_live_same_channel_id_is_refused_by_asterisk(live):
         assert await provider.hangup(request.call_id) is False
     finally:
         await provider.close()
+
+
+async def test_live_asterisk_reaches_the_audio_socket(live_voice):
+    w = live_voice()
+    async with w.service:
+        check = await w.service.provider.check()
+        media = await w.service.provider.check_media()
+    assert check["status"] == "ok", check
+    assert media["status"] == "ok", media
+    assert media["connect_ms"] < 5000
+
+
+async def test_live_voice_call_hears_the_person(live_voice):
+    # The far end says "hello world" (Asterisk's sound file) after wewln's greeting.
+    w = live_voice(heard=["hello world"], replies=["Спасибо, до свидания! [END]"])
+    async with w.service:
+        outcome = await call(w.service, SPEAKS)
+    kinds = [t["kind"] for t in w.store.transcript(outcome.attempt_id)]
+    assert kinds == ["greeting", "speech", "reply"], outcome
+    assert (outcome.state, outcome.end_reason) == (CallState.COMPLETED, "conversation_end")
+    assert w.runtime.stt.heard_ms[0] >= 500  # the recording came through the call audio
+
+
+async def test_live_voice_call_audio_goes_both_ways(live_voice):
+    # Echo() sends wewln's greeting back; without barge-in it is heard once the greeting ends.
+    w = live_voice(heard=["эхо"], replies=["До свидания! [END]"], barge_in=False)
+    async with w.service:
+        outcome = await call(w.service, ECHO)
+    kinds = [t["kind"] for t in w.store.transcript(outcome.attempt_id)]
+    assert kinds == ["greeting", "speech", "reply"], outcome
+    assert outcome.end_reason == "conversation_end"
+    # About the greeting's 1.2 s came back.
+    assert w.runtime.stt.heard_ms[0] >= 800, w.runtime.stt.heard_ms
