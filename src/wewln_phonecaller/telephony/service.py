@@ -34,7 +34,6 @@ from ..storage.calls import CallStore, DialTicket, KillSwitchEngagedError, parse
 from ..storage.repository import InvalidInputError
 from .base import (
     CallRequest,
-    EventKind,
     ProviderError,
     ProviderEvent,
     ProviderUncertainError,
@@ -226,9 +225,11 @@ class CallService:
             extra={"kind": event.kind.value, "outcome": outcome, "source": event.source},
         )
         self._changed.set()
-        if outcome == "ignored" and event.kind != EventKind.HANGUP:
-            # Maybe a call wewln already counts as ended: then it must not live on. In its own
-            # task: the provider may be delivering this event from the call it would end.
+        if outcome == "after_end":
+            # Progress on a call that ended in wewln without the provider reporting its end: it
+            # must not live on. Decided when the event was applied (a repeated ringing signal
+            # just before a hangup is not such a call). In its own task: the provider may be
+            # delivering this event from the call it would end.
             task = asyncio.create_task(self._end_late_call(event.call_id))
             self._late_hangups.add(task)
             task.add_done_callback(self._late_hangups.discard)
@@ -237,7 +238,7 @@ class CallService:
         """The provider reports progress on a call that ended in wewln (its hangup was never
         confirmed, or the provider created it after wewln gave up waiting): end it."""
         attempt = await asyncio.to_thread(self.store.find_attempt, call_id)
-        if attempt is None or CallState(attempt["state"]) not in TERMINAL_STATES:
+        if attempt is None:
             return
         log.warning("call_ended_late", extra={"attempt_id": attempt["id"]})
         try:
