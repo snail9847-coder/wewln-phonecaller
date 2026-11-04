@@ -14,6 +14,8 @@ docs/ASTERISK.md for the setup.
   asks for the call's audio: wewln creates a mixing bridge and an `externalMedia` channel
   (AudioSocket over TCP, 8 kHz slin) that Asterisk connects to wewln's AudioSocket server with
   a one-time UUID, and puts both channels in the bridge. Both are removed when the call ends.
+  If Asterisk drops the audio channel while the call is still up (a bug of Asterisk 20.14-20.16
+  and 22.4-22.6, see MAX_MEDIA_RECONNECTS), wewln connects a new one to the same bridge.
 - The password travels only in the Authorization header (never in a URL) and is never logged.
 """
 
@@ -34,7 +36,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-from ..voice.transport import AudioSocketConnection, AudioSocketServer
+from ..voice.transport import AudioSocketConnection, AudioSocketServer, MediaStream
 from . import PROVIDERS
 from .base import (
     CallRequest,
@@ -58,9 +60,17 @@ _TRUNK = re.compile(r"^PJSIP/\{number\}@(?P<resource>[A-Za-z0-9_.-]+)$")
 # Channels wewln placed (see base.provider_call_id); a Local channel's ";2" half is not one.
 _OUR_CALL = re.compile(r"^wewln-[0-9a-f]{32}$")
 # The audio channel wewln adds to one of its calls (see open_media).
-_OUR_MEDIA = re.compile(r"^wewln-[0-9a-f]{32}-media$")
+# ("-media-2" and so on after a reconnect).
+_OUR_MEDIA = re.compile(r"^wewln-[0-9a-f]{32}-media(-[0-9]{1,2})?$")
 MEDIA_SUFFIX = "-media"
 BRIDGE_SUFFIX = "-bridge"
+# Asterisk 20.14-20.16 and 22.4-22.6 (Ubuntu 26.04 has 22.5.2) may hang up the AudioSocket
+# channel in the middle of a call: "Failed to read header from AudioSocket because: Resource
+# temporarily unavailable" (fixed in 20.17, 22.7 and 23.1). The call stays up, so wewln
+# connects a new audio channel to the call's bridge, at most this many times per call.
+MAX_MEDIA_RECONNECTS = 5
+# How long a lost audio connection waits for the call's own hangup before reconnecting.
+MEDIA_LOSS_GRACE_S = 0.25
 _DIAL_STATUS = {
     "RINGING": EventKind.RINGING,
     "PROGRESS": EventKind.RINGING,  # early media (183) instead of a ringing signal
@@ -105,6 +115,73 @@ class _Media:
     bridge_id: str
     call_uuid: str
     connection: AudioSocketConnection | None = None
+    reconnects: int = 0
+
+
+class _CallAudio(MediaStream):
+    """The audio of one call as the voice engine sees it: one stream for the whole call,
+    even when Asterisk drops the audio channel and wewln connects a new one."""
+
+    def __init__(self, provider: AsteriskAriProvider, call_id: str, media: _Media) -> None:
+        self._provider = provider
+        self._call_id = call_id
+        self._media = media
+        self._closed = False
+        self._failed = False
+        self._reconnect: asyncio.Task[bool] | None = None
+
+    @property
+    def connection(self) -> AudioSocketConnection | None:
+        return self._media.connection
+
+    @property
+    def reconnects(self) -> int:
+        return self._media.reconnects
+
+    @property
+    def closed(self) -> bool:
+        if self._closed or self._failed:
+            return True
+        if self._reconnect is not None:
+            return False
+        connection = self._media.connection
+        return connection is None or connection.closed
+
+    async def read(self) -> bytes | None:
+        while True:
+            if self._reconnect is not None:
+                # Shielded: the engine may cancel a read that waits too long; the reconnect
+                # goes on and the next read waits for it.
+                ok = await asyncio.shield(self._reconnect)
+                self._reconnect = None
+                self._failed = not ok
+            connection = self._media.connection
+            if connection is None or self._closed or self._failed:
+                return None
+            chunk = await connection.read()
+            if chunk is not None:
+                return chunk
+            if self._closed or connection.closed_here:
+                return None  # wewln ended it (the call ended)
+            task = asyncio.create_task(
+                self._provider._reconnect_media(self._call_id, self._media, connection)
+            )
+            self._provider._media_tasks.add(task)
+            task.add_done_callback(self._provider._media_tasks.discard)
+            self._reconnect = task
+
+    async def write(self, pcm: bytes) -> None:
+        connection = self._media.connection
+        if connection is not None and not self._closed:
+            await connection.write(pcm)  # dropped while a new connection is being made
+
+    async def close(self) -> None:
+        self._closed = True
+        if self._reconnect is not None:
+            self._reconnect.cancel()
+        connection = self._media.connection
+        if connection is not None:
+            await connection.close()
 
 
 def format_number(e164: str, number_format: str) -> str:
@@ -406,7 +483,7 @@ class AsteriskAriProvider(TelephonyProvider):
 
     # ------------------------------------------------------------------ call audio
 
-    async def open_media(self, call_id: str) -> AudioSocketConnection:
+    async def open_media(self, call_id: str) -> MediaStream:
         server = self.audiosocket
         if not self.media_enabled or server is None:
             raise MediaError("call audio is not enabled (WEWLN_VOICE_MODE=ai)")
@@ -436,7 +513,7 @@ class AsteriskAriProvider(TelephonyProvider):
             "call_media_connected",
             extra={"setup_ms": round((time.perf_counter() - started) * 1000)},
         )
-        return media.connection
+        return _CallAudio(self, call_id, media)
 
     async def _connect_media(
         self, call_id: str, media: _Media, connected: asyncio.Future[AudioSocketConnection]
@@ -448,6 +525,13 @@ class AsteriskAriProvider(TelephonyProvider):
         )
         if status != 200:
             raise MediaError(f"Asterisk could not create the audio bridge (HTTP {status})")
+        await self._attach_media(media, connected, f"{call_id},{media.channel_id}")
+
+    async def _attach_media(
+        self, media: _Media, connected: asyncio.Future[AudioSocketConnection], channels: str
+    ) -> None:
+        """Create the externalMedia channel, wait for its connection and put `channels` (the
+        call and the audio channel, or only the audio channel) in the bridge."""
         status = await self._request(
             "POST",
             "/ari/channels/externalMedia",
@@ -481,10 +565,62 @@ class AsteriskAriProvider(TelephonyProvider):
         status = await self._request(
             "POST",
             f"/ari/bridges/{quote(media.bridge_id, safe='')}/addChannel",
-            params={"channel": f"{call_id},{media.channel_id}"},
+            params={"channel": channels},
         )
         if status not in (200, 204):
             raise MediaError(f"Asterisk could not bridge the call audio (HTTP {status})")
+
+    async def _reconnect_media(
+        self, call_id: str, media: _Media, lost: AudioSocketConnection
+    ) -> bool:
+        """Asterisk closed the call's audio connection. Unless the call is ending, a new audio
+        channel joins the call's bridge (the person hears a short gap). True when connected."""
+        await asyncio.sleep(MEDIA_LOSS_GRACE_S)  # the call's hangup usually arrives by now
+        extra = {"call_id": call_id, "reconnects": media.reconnects}
+        server = self.audiosocket
+        if self._closing or server is None or self._media.get(call_id) is not media:
+            return False
+        if media.connection is not lost:
+            return media.connection is not None and not media.connection.closed
+        if media.reconnects >= MAX_MEDIA_RECONNECTS:
+            log.error("call_media_lost", extra=extra)
+            return False
+        if await self.call_exists(call_id) is not True:
+            return False  # the call has ended (or Asterisk cannot tell): no new audio
+        log.warning("call_media_dropped_by_asterisk", extra=extra)
+        server.release(lost)
+        old_channel = media.channel_id
+        media.reconnects += 1
+        media.channel_id = f"{call_id}{MEDIA_SUFFIX}-{media.reconnects + 1}"
+        media.call_uuid, connected = server.expect()
+        media.connection = None
+        self._stasis.pop(old_channel, None)
+        with contextlib.suppress(ProviderError):
+            await self._request("DELETE", f"/ari/channels/{quote(old_channel, safe='')}")
+        started = time.perf_counter()
+        try:
+            await self._attach_media(media, connected, media.channel_id)
+        except (ProviderError, OSError) as exc:
+            server.forget(media.call_uuid)
+            log.error("call_media_reconnect_failed", extra={**extra, "error": str(exc)})
+            return False
+        if self._media.get(call_id) is not media:
+            # The call ended meanwhile; _drop_media did not see the new connection.
+            if media.connection is not None:
+                await media.connection.close()
+                server.release(media.connection)
+            with contextlib.suppress(ProviderError):
+                await self._request("DELETE", f"/ari/channels/{quote(media.channel_id, safe='')}")
+            return False
+        log.warning(
+            "call_media_reconnected",
+            extra={
+                **extra,
+                "reconnects": media.reconnects,
+                "setup_ms": round((time.perf_counter() - started) * 1000),
+            },
+        )
+        return True
 
     async def _drop_media(self, call_id: str) -> None:
         """Close the audio connection and remove the audio channel and the bridge."""
