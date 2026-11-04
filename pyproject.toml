@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wewln-phonecaller"
-version = "0.2.0"
+version = "0.3.0"
 description = "Russian-language AI voice calling for Windows 10/11, optionally controlled from Notion; simulation-first."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -40,6 +40,9 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra"
+markers = [
+  "asterisk_live: needs a running Asterisk with ARI (ASTERISK_LIVE_* variables; CI job asterisk-live)",
+]
 
 [tool.ruff]
 line-length = 100
