@@ -66,7 +66,7 @@ def test_init_db_is_idempotent(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("WEWLN_DATA_DIR", str(tmp_path / "d"))
     assert main(["init-db"]) == 0
     assert main(["init-db"]) == 0
-    assert "(schema version 2)" in capsys.readouterr().out
+    assert "(schema version 3)" in capsys.readouterr().out
     assert (tmp_path / "d" / "wewln.db").is_file()
 
 

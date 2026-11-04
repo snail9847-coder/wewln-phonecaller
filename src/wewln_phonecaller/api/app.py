@@ -2,6 +2,10 @@
 
 The background Notion sync (when enabled) runs inside this application; Notion problems never
 make the backend "not ready", because everything works offline and is synced later.
+
+Calls are dialed by `wewln calls ...` (one dialer at a time); the API lists them, cancels one,
+engages the emergency stop and accepts signed call-status webhooks. The running dialer picks
+cancels and the emergency stop up from the database within a second.
 """
 
 from __future__ import annotations
@@ -30,8 +34,12 @@ from ..notion.sync import SyncService
 from ..redact import mask_phone_numbers
 from ..safety import evaluate_real_calls
 from ..storage import Database
+from ..storage.calls import CallStore
 from ..storage.repository import Repository
 from ..telephony import PROVIDERS
+from ..telephony.factory import create_repository
+from ..telephony.service import DIALER_LOCK
+from ..telephony.webhooks import MAX_BODY_BYTES, parse_webhook_event, verify_webhook
 
 log = logging.getLogger("wewln.api")
 
@@ -40,6 +48,8 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 REQUEST_ID_HEADER = "X-Request-ID"
 _VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 PUBLIC_PATHS = frozenset({"/health", "/ready"})
+# Authenticated by its HMAC signature instead of the bearer token (see telephony/webhooks.py).
+WEBHOOK_PATH = "/api/v1/telephony/events"
 _HTTP_CODES = {
     400: "bad_request",
     401: "unauthorized",
@@ -52,6 +62,7 @@ _HTTP_CODES = {
 SETTINGS_KEY = web.AppKey("settings", Settings)
 DB_KEY = web.AppKey("db", Database)
 REPO_KEY = web.AppKey("repo", Repository)
+CALLS_KEY = web.AppKey("calls", CallStore)
 SYNC_KEY = web.AppKey("notion_sync", SyncService)
 MAX_REASON_LENGTH = 500
 
@@ -119,7 +130,7 @@ async def auth_middleware(request: web.Request, handler: Handler) -> web.StreamR
 
     Without a configured token the protected endpoints stay closed (fail closed).
     """
-    if request.path in PUBLIC_PATHS:
+    if request.path in PUBLIC_PATHS or request.path == WEBHOOK_PATH:
         return await handler(request)
     expected = request.app[SETTINGS_KEY].api_token
     if expected is None:
@@ -168,6 +179,22 @@ async def ready(request: web.Request) -> web.Response:
         asyncio.to_thread(db.check), asyncio.to_thread(_check_data_dir, settings.data_dir)
     )
     provider = PROVIDERS[settings.telephony_provider]
+    kill_switch = None
+    if database["status"] == "ok":
+        with contextlib.suppress(WewlnError):
+            kill_switch = await asyncio.to_thread(request.app[CALLS_KEY].kill_switch)
+    telephony: dict[str, Any] = {
+        "status": "ok",
+        "provider": provider.name,
+        "places_real_calls": provider.places_real_calls,
+    }
+    if settings.telephony_provider == "asterisk":
+        problems = settings.provider_problems
+        telephony["status"] = "error" if problems else "ok"
+        telephony["configured"] = not problems
+        telephony["ari_url"] = settings.ari_url
+    if kill_switch is not None:
+        telephony["emergency_stop"] = True
     if not settings.notion_enabled:
         notion: dict[str, Any] = {"status": "disabled"}
     elif SYNC_KEY in request.app:
@@ -179,12 +206,10 @@ async def ready(request: web.Request) -> web.Response:
         "database": database,
         "data_dir": data_dir,
         "notion": notion,
-        "telephony": {
-            "status": "ok",
-            "provider": provider.name,
-            "places_real_calls": provider.places_real_calls,
-        },
-        "real_calls": evaluate_real_calls(settings).as_dict(),
+        "telephony": telephony,
+        "real_calls": evaluate_real_calls(
+            settings, kill_switch_engaged=kill_switch is not None
+        ).as_dict(),
     }
     is_ready = database["status"] == "ok" and data_dir["status"] == "ok"
     return web.json_response(
@@ -295,6 +320,111 @@ async def dnc_add(request: web.Request) -> web.Response:
     return web.json_response({"added": added, "phone": mask_phone_numbers(phone)})
 
 
+def _attempt_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "job_id": row["job_id"],
+        "attempt": row["attempt"],
+        "provider": row["provider"],
+        "simulated": bool(row["simulated"]),
+        "target": row["target"],
+        "phone": row["phone_masked"],
+        "state": row["state"],
+        "end_reason": row["end_reason"],
+        "hangup_cause": row["hangup_cause"],
+        "error_code": row["error_code"],
+        "campaign": row.get("campaign_name"),
+        "created_at": row["created_at"],
+        "answered_at": row["answered_at"],
+        "ended_at": row["ended_at"],
+    }
+
+
+async def calls_list(request: web.Request) -> web.Response:
+    """Protected: recent call attempts (numbers masked), the emergency stop and the dialer."""
+    store = request.app[CALLS_KEY]
+    active_only = request.query.get("active", "") in {"1", "true", "yes"}
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        raise WewlnError(
+            "'limit' must be a number", code="invalid_input", http_status=400
+        ) from None
+    rows = await asyncio.to_thread(store.list_attempts, limit=limit, active_only=active_only)
+    kill_switch = await asyncio.to_thread(store.kill_switch)
+    dialer = await asyncio.to_thread(store.db.lock_holder, DIALER_LOCK)
+    return web.json_response(
+        {
+            "calls": [_attempt_view(r) for r in rows],
+            "emergency_stop": kill_switch,
+            "dialer_running": dialer is not None,
+        }
+    )
+
+
+async def call_cancel(request: web.Request) -> web.Response:
+    """Protected: ask the running dialer to end one call."""
+    store = request.app[CALLS_KEY]
+    attempt_id = int(request.match_info["attempt_id"])
+    await asyncio.to_thread(store.get_attempt, attempt_id)  # 404 for an unknown call
+    requested = await asyncio.to_thread(store.request_cancel, attempt_id, actor="api")
+    dialer = await asyncio.to_thread(store.db.lock_holder, DIALER_LOCK)
+    return web.json_response({"cancel_requested": requested, "dialer_running": dialer is not None})
+
+
+async def calls_stop_all(request: web.Request) -> web.Response:
+    """Protected: the emergency stop. Every call is ended and nothing is dialed until
+    `wewln calls resume` (deliberately not available over the API)."""
+    store = request.app[CALLS_KEY]
+    reason = _text_field(await _json_body(request), "reason")
+    engaged = await asyncio.to_thread(store.engage_kill_switch, source="api", reason=reason)
+    active = await asyncio.to_thread(store.list_attempts, active_only=True)
+    dialer = await asyncio.to_thread(store.db.lock_holder, DIALER_LOCK)
+    return web.json_response(
+        {
+            "emergency_stop": "engaged" if engaged else "already_engaged",
+            "active_calls": len(active),
+            "dialer_running": dialer is not None,
+        }
+    )
+
+
+async def _read_body(request: web.Request, limit: int) -> bytes:
+    """The whole body (it may arrive in many pieces), refused with 413 beyond `limit`."""
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := await request.content.read(64 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=size)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def telephony_events(request: web.Request) -> web.Response:
+    """Signed call-status events (HMAC, see telephony/webhooks.py). Each event applies once."""
+    settings = request.app[SETTINGS_KEY]
+    if settings.webhook_secret is None:
+        raise web.HTTPNotFound()
+    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=MAX_BODY_BYTES, actual_size=request.content_length
+        )
+    body = await _read_body(request, MAX_BODY_BYTES)
+    verify_webhook(
+        settings.webhook_secret.get_secret_value(),
+        request.headers,
+        body,
+        now=time.time(),
+        tolerance_s=settings.webhook_tolerance,
+    )
+    event = parse_webhook_event(body)
+    outcome = await asyncio.to_thread(request.app[CALLS_KEY].apply_event, event)
+    log.info("webhook_event", extra={"kind": event.kind.value, "outcome": outcome})
+    return web.json_response({"result": outcome})
+
+
 def create_app(
     settings: Settings, db: Database, *, sync_service: SyncService | None = None
 ) -> web.Application:
@@ -303,11 +433,8 @@ def create_app(
     )
     app[SETTINGS_KEY] = settings
     app[DB_KEY] = db
-    app[REPO_KEY] = Repository(
-        db,
-        default_language=settings.default_language,
-        default_region=settings.default_phone_region,
-    )
+    app[REPO_KEY] = create_repository(settings, db)
+    app[CALLS_KEY] = CallStore(app[REPO_KEY], retry_delay_s=settings.call_retry_delay)
     if sync_service is not None:
         app[SYNC_KEY] = sync_service
 
@@ -326,6 +453,10 @@ def create_app(
     app.router.add_get("/api/v1/notion/status", notion_status)
     app.router.add_post("/api/v1/notion/sync", notion_sync_now)
     app.router.add_get("/api/v1/campaigns", campaigns_list)
-    app.router.add_post(r"/api/v1/campaigns/{campaign_id:\d+}/stop", campaign_stop)
+    app.router.add_post(r"/api/v1/campaigns/{campaign_id:\d{1,18}}/stop", campaign_stop)
     app.router.add_post("/api/v1/dnc", dnc_add)
+    app.router.add_get("/api/v1/calls", calls_list)
+    app.router.add_post(r"/api/v1/calls/{attempt_id:\d{1,18}}/cancel", call_cancel)
+    app.router.add_post("/api/v1/calls/stop-all", calls_stop_all)
+    app.router.add_post(WEBHOOK_PATH, telephony_events)
     return app

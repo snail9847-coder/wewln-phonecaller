@@ -23,6 +23,7 @@ from ..domain import (
     FINAL_CAMPAIGN_STATUSES,
     OPEN_JOB_STATUSES,
     PHONE_ERROR_REASONS,
+    QUEUED_NOTE_REASONS,
     REACTIVATABLE_REASONS,
     CampaignStatus,
     JobReason,
@@ -32,7 +33,7 @@ from ..domain import (
 )
 from ..errors import WewlnError
 from ..notion.ids import compact_id
-from ..phones import normalize_phone
+from ..phones import dial_policy_problem, normalize_phone
 from .db import Database
 
 MAX_NAME_LENGTH = 200
@@ -139,11 +140,15 @@ class Repository:
         *,
         default_language: str = "ru-RU",
         default_region: str | None = None,
+        allowed_regions: Iterable[str] = (),
         clock: Callable[[], str] = utc_now,
     ) -> None:
         self.db = db
         self.default_language = default_language
         self.default_region = default_region
+        # Countries numbers may be called in (WEWLN_CALL_REGIONS); empty: no restriction here
+        # (real calls are then blocked by the real-call gate anyway).
+        self.allowed_regions = frozenset(r.upper() for r in allowed_regions)
         self._now = clock
 
     # ------------------------------------------------------------------ campaigns
@@ -690,11 +695,15 @@ class Repository:
             report.add(self._plan_campaign(conn, campaign, suppressed))
         return report
 
-    @staticmethod
     def contact_gate(
-        contact: sqlite3.Row, suppressed: set[str]
+        self, contact: sqlite3.Row, suppressed: set[str]
     ) -> tuple[JobStatus, JobReason | None]:
-        """Desired job status for a contact that belongs to the campaign."""
+        """Desired job status for a contact that belongs to the campaign.
+
+        Besides do-not-call and a valid number, the dial policy applies: premium-rate and
+        similar numbers are never called, and with WEWLN_CALL_REGIONS set only numbers of those
+        countries are. A valid number is not proof that it is reachable or may be called.
+        """
         if contact["missing_in_notion"]:
             return JobStatus.CANCELLED, JobReason.CONTACT_DELETED
         if contact["notion_dnc"] or (contact["phone_e164"] and contact["phone_e164"] in suppressed):
@@ -703,7 +712,40 @@ class Repository:
             return JobStatus.BLOCKED, PHONE_ERROR_REASONS.get(
                 contact["phone_error"] or "invalid", JobReason.PHONE_INVALID
             )
+        problem = dial_policy_problem(contact["phone_e164"], self.allowed_regions)
+        if problem is not None:
+            return JobStatus.BLOCKED, PHONE_ERROR_REASONS[problem]
         return JobStatus.QUEUED, None
+
+    def callable_now(
+        self,
+        conn: sqlite3.Connection,
+        job: sqlite3.Row,
+        suppressed: set[str],
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Every condition for dialing this queued job, checked at dial time in a transaction."""
+        if job["status"] != JobStatus.QUEUED:
+            return False
+        next_at = job["next_attempt_at"]
+        if next_at and next_at > (now or self._now()):
+            return False
+        campaign = self._campaign(conn, job["campaign_id"])
+        contact = conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (job["contact_id"],)
+        ).fetchone()
+        member = conn.execute(
+            "SELECT 1 FROM campaign_contacts WHERE campaign_id = ? AND contact_id = ?",
+            (job["campaign_id"], job["contact_id"]),
+        ).fetchone()
+        return (
+            self.campaign_runnable(campaign)
+            and member is not None
+            and contact is not None
+            and self.contact_gate(contact, suppressed) == (JobStatus.QUEUED, None)
+            and (campaign["source"] != "notion" or job["notion_page_id"] is not None)
+        )
 
     @staticmethod
     def campaign_runnable(campaign: sqlite3.Row) -> bool:
@@ -768,6 +810,8 @@ class Repository:
             else:
                 target = self.contact_gate(contacts[job["contact_id"]], suppressed)
             current = (status, JobReason(job["reason"]) if job["reason"] else None)
+            if status == JobStatus.QUEUED and current[1] in QUEUED_NOTE_REASONS:
+                current = (JobStatus.QUEUED, None)  # waiting for a retry is still "queued"
             if status in OPEN_JOB_STATUSES:
                 if target != current:
                     update(job, *target)
@@ -989,21 +1033,7 @@ class Repository:
             for job in conn.execute(sql + " ORDER BY id", params).fetchall():
                 if report.completed >= limit:
                     break
-                campaign = self._campaign(conn, job["campaign_id"])
-                contact = conn.execute(
-                    "SELECT * FROM contacts WHERE id = ?", (job["contact_id"],)
-                ).fetchone()
-                member = conn.execute(
-                    "SELECT 1 FROM campaign_contacts WHERE campaign_id = ? AND contact_id = ?",
-                    (job["campaign_id"], job["contact_id"]),
-                ).fetchone()
-                callable_now = (
-                    self.campaign_runnable(campaign)
-                    and member is not None
-                    and self.contact_gate(contact, suppressed) == (JobStatus.QUEUED, None)
-                    and (campaign["source"] != "notion" or job["notion_page_id"] is not None)
-                )
-                if not callable_now:
+                if not self.callable_now(conn, job, suppressed, now=now):
                     report.skipped += 1
                     continue
                 attempt = job["attempts"] + 1
@@ -1023,7 +1053,7 @@ class Repository:
                 )
                 conn.execute(
                     "UPDATE call_jobs SET status = 'done', reason = ?, attempts = ?, "
-                    "notion_dirty = 1, updated_at = ? WHERE id = ?",
+                    "next_attempt_at = NULL, notion_dirty = 1, updated_at = ? WHERE id = ?",
                     (JobReason.SIMULATED.value, attempt, now, job["id"]),
                 )
                 report.completed += 1

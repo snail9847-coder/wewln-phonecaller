@@ -155,4 +155,92 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=3,
+        name="telephony_attempts_events_permits",
+        statements=(
+            # A job waiting for its next attempt (retry after busy / no answer).
+            "ALTER TABLE call_jobs ADD COLUMN next_attempt_at TEXT",
+            # One row per dial attempt, written before the provider is asked to dial: after a
+            # crash every call that may exist is known. `provider_call_id` is derived from the
+            # idempotency key, so the same attempt can never become two calls.
+            """
+            CREATE TABLE call_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('job', 'test')),
+                job_id INTEGER REFERENCES call_jobs (id),
+                attempt INTEGER NOT NULL DEFAULT 1,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                provider_call_id TEXT NOT NULL UNIQUE,
+                simulated INTEGER NOT NULL,
+                target TEXT NOT NULL DEFAULT 'phone' CHECK (target IN ('phone', 'softphone')),
+                phone_masked TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL CHECK (state IN ('pending', 'dialing', 'ringing',
+                    'answered', 'completed', 'busy', 'no_answer', 'rejected', 'unreachable',
+                    'failed', 'cancelled')),
+                end_reason TEXT,
+                end_request TEXT,
+                cancel_requested TEXT,
+                hangup_requested_at TEXT,
+                hangup_tries INTEGER NOT NULL DEFAULT 0,
+                hangup_cause INTEGER,
+                hangup_cause_txt TEXT,
+                tech_cause INTEGER,
+                error_code TEXT,
+                created_at TEXT NOT NULL,
+                dial_started_at TEXT,
+                ringing_at TEXT,
+                answered_at TEXT,
+                ended_at TEXT,
+                updated_at TEXT NOT NULL,
+                CHECK ((kind = 'job') = (job_id IS NOT NULL))
+            )
+            """,
+            "CREATE UNIQUE INDEX idx_call_attempts_job_attempt ON call_attempts (job_id, attempt) "
+            "WHERE job_id IS NOT NULL",
+            # At most one live attempt per job, enforced by SQLite itself.
+            "CREATE UNIQUE INDEX idx_call_attempts_one_active ON call_attempts (job_id) "
+            "WHERE job_id IS NOT NULL AND state IN ('pending', 'dialing', 'ringing', 'answered')",
+            "CREATE INDEX idx_call_attempts_state ON call_attempts (state)",
+            # Every provider event once: a repeated event (reconnect, webhook retry) is ignored.
+            """
+            CREATE TABLE call_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                provider_call_id TEXT NOT NULL,
+                attempt_id INTEGER REFERENCES call_attempts (id),
+                kind TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_call_events_received ON call_events (received_at)",
+            # The operator's explicit, short-lived permission for a real test call to one number.
+            """
+            CREATE TABLE real_call_permits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_e164 TEXT NOT NULL,
+                max_calls INTEGER NOT NULL DEFAULT 1 CHECK (max_calls BETWEEN 1 AND 3),
+                used INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+            )
+            """,
+            "CREATE INDEX idx_real_call_permits_phone ON real_call_permits (phone_e164)",
+            # Runtime switches shared by all processes (the emergency stop).
+            """
+            CREATE TABLE runtime_flags (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )

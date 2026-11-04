@@ -185,3 +185,105 @@ def test_unknown_variables_are_reported(tmp_path):
     env.write_text("WEWLN_MDOE=production\nWEWLN_MODE=simulation\nOTHER=1\n", encoding="utf-8")
     unknown = find_unknown_variables(environ={"WEWLN_KILLSWITCH": "1", "PATH": "x"}, env_file=env)
     assert unknown == ["WEWLN_KILLSWITCH", "WEWLN_MDOE"]
+
+
+# ---------------------------------------------------------------------- telephony settings
+
+
+def test_call_regions_are_normalized_and_checked(make_settings):
+    assert make_settings(call_regions=" ru, az ,AZ").call_regions == "AZ,RU"
+    assert make_settings(call_regions="az").allowed_call_regions == frozenset({"AZ"})
+    assert make_settings().allowed_call_regions == frozenset()
+    with pytest.raises(ConfigError) as exc:
+        make_settings(call_regions="AZ,XX")
+    assert "WEWLN_CALL_REGIONS" in problems(exc)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://192.168.1.10:8088",  # plain http only on this computer
+        "ftp://127.0.0.1:8088",
+        "http://wewln:secret@127.0.0.1:8088",
+        "http://127.0.0.1:8088/ari",
+    ],
+)
+def test_unsafe_ari_urls_are_rejected(make_settings, url):
+    with pytest.raises(ConfigError) as exc:
+        make_settings(ari_url=url)
+    assert "WEWLN_ARI_URL" in problems(exc)
+    assert "secret" not in problems(exc)
+
+
+def test_ari_urls_that_are_accepted(make_settings):
+    assert make_settings(ari_url="http://127.0.0.1:8088/").ari_url == "http://127.0.0.1:8088"
+    assert make_settings(ari_url="http://localhost:8088").ari_url == "http://localhost:8088"
+    assert make_settings(ari_url="https://pbx.example.org:8089").ari_url.startswith("https://")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("asterisk_endpoint", "PJSIP/wewln-trunk"),  # no {number}
+        ("asterisk_endpoint", "PJSIP/{number}@a&PJSIP/{number}@b"),  # two calls at once
+        ("asterisk_endpoint", "PJSIP/{number}@wewln trunk"),
+        ("asterisk_softphone_endpoint", "PJSIP/softphone@wewln-trunk"),
+        ("asterisk_softphone_endpoint", "Local/600@default"),
+        ("asterisk_answer_media", "http://example.org/a.wav"),
+        ("caller_id", "12345"),
+        ("ari_app", "wewln app"),
+        ("call_ring_timeout", 2),
+        ("call_max_duration", 5000),
+    ],
+)
+def test_invalid_telephony_settings_are_rejected(make_settings, name, value):
+    with pytest.raises(ConfigError) as exc:
+        make_settings(**{name: value})
+    assert "WEWLN_" + name.upper() in problems(exc)
+
+
+def test_softphone_must_not_be_the_trunk(make_settings):
+    with pytest.raises(ConfigError) as exc:
+        make_settings(asterisk_softphone_endpoint="PJSIP/wewln-trunk")
+    assert "not the SIP trunk" in problems(exc)
+
+
+def test_telephony_values_are_normalized(make_settings):
+    s = make_settings(caller_id="+994 12 123 45 67", asterisk_answer_media="")
+    assert s.caller_id == "+994121234567"
+    assert s.asterisk_answer_media is None
+
+
+def test_webhook_secret_must_be_long(make_settings):
+    with pytest.raises(ConfigError) as exc:
+        make_settings(webhook_secret="short-webhook-secret")
+    assert "WEWLN_WEBHOOK_SECRET" in problems(exc)
+    assert "short-webhook-secret" not in problems(exc)
+
+
+def test_asterisk_needs_the_ari_password(make_settings):
+    s = make_settings(telephony_provider="asterisk")
+    assert s.provider_problems and "ari-password" in s.provider_problems[0]
+    assert make_settings(telephony_provider="asterisk", ari_password="pw").provider_problems == []
+
+
+def test_telephony_secrets_come_from_the_store_and_stay_hidden(make_settings):
+    from wewln_phonecaller import secret_store
+
+    ari, hook = "ari-pass-from-store", "h" * 40
+    store = secret_store.default_store()
+    store.set(secret_store.ARI_PASSWORD_KEY, ari)
+    store.set(secret_store.WEBHOOK_SECRET_KEY, hook)
+    s = make_settings(telephony_provider="asterisk")
+    assert s.ari_password.get_secret_value() == ari
+    assert (s.ari_password_source, s.webhook_secret_source) == (
+        "credential store",
+        "credential store",
+    )
+    for text in (repr(s), s.model_dump_json(), str(s.redacted_summary())):
+        assert ari not in text and hook not in text
+    assert {ari, hook} <= set(s.secret_values())
+    summary = s.redacted_summary()
+    assert summary["ari_password"] == "set (credential store)"
+    env = make_settings(ari_password="ari-pass-from-env")
+    assert env.ari_password_source != "credential store"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -26,8 +27,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .errors import ConfigError
 from .notion.ids import normalize_notion_id
-from .phones import SUPPORTED_REGIONS
-from .secret_store import NOTION_TOKEN_KEY, SecretStore, SecretStoreUnavailable, default_store
+from .phones import SUPPORTED_REGIONS, normalize_phone
+from .secret_store import (
+    ARI_PASSWORD_KEY,
+    NOTION_TOKEN_KEY,
+    WEBHOOK_SECRET_KEY,
+    SecretStore,
+    SecretStoreUnavailable,
+    default_store,
+)
 
 ENV_PREFIX = "WEWLN_"
 PRODUCTION_CONFIRM_PHRASE = "I_ACCEPT_REAL_CALLS"
@@ -42,6 +50,24 @@ NOTION_DB_SETTINGS = {
 }
 # Conversation languages. Russian is mandatory; more languages are added here later.
 SUPPORTED_LANGUAGES: dict[str, str] = {"ru-RU": "Русский"}
+MIN_WEBHOOK_SECRET_LENGTH = 32
+MAX_SECRET_LENGTH = 500
+MOCK_SCENARIOS = (
+    "answer",
+    "busy",
+    "no_answer",
+    "reject",
+    "unreachable",
+    "fail",
+    "silent",
+    "answer_hold",
+    "mixed",
+)
+_ARI_APP = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DIAL_TEMPLATE = re.compile(r"^[A-Za-z]{2,16}/[A-Za-z0-9_.@/+{}-]{1,180}$")
+_SOFTPHONE = re.compile(r"^PJSIP/[A-Za-z0-9_-]{1,64}$")
+_MEDIA = re.compile(r"^(sound|recording|tone|digits|number):[A-Za-z0-9_/,.-]{1,100}$")
+_TRUNK_OF = re.compile(r"^PJSIP/\{number\}@(?P<trunk>[A-Za-z0-9_.-]+)$")
 
 
 class Settings(BaseSettings):
@@ -57,8 +83,31 @@ class Settings(BaseSettings):
     mode: Literal["simulation", "production"] = "simulation"
     production_confirm: str = ""
     kill_switch: bool = False
-    # Only the simulation provider exists in this version.
-    telephony_provider: Literal["mock"] = "mock"
+    # mock: simulated calls only. asterisk: own Asterisk PBX over ARI (can place real calls,
+    # only behind the real-call gate; see docs/ASTERISK.md).
+    telephony_provider: Literal["mock", "asterisk"] = "mock"
+
+    # Calls. Real calls go only to numbers of these countries (ISO codes, comma-separated).
+    call_regions: str = ""
+    call_ring_timeout: int = Field(default=30, ge=5, le=120)
+    call_max_duration: int = Field(default=300, ge=10, le=3600)
+    call_retry_delay: int = Field(default=900, ge=60, le=86400)
+    mock_scenario: str = "answer"
+
+    # Asterisk REST Interface (ARI). The password lives in the credential store or the env.
+    ari_url: str = "http://127.0.0.1:8088"
+    ari_username: str = "wewln"
+    ari_password: SecretStr | None = None
+    ari_app: str = "wewln"
+    asterisk_endpoint: str = "PJSIP/{number}@wewln-trunk"
+    asterisk_number_format: Literal["e164", "digits", "00"] = "e164"
+    asterisk_softphone_endpoint: str = "PJSIP/softphone"
+    asterisk_answer_media: str | None = "sound:hello-world"
+    caller_id: str | None = None
+
+    # Signed call-status webhooks (POST /api/v1/telephony/events). Closed while no secret is set.
+    webhook_secret: SecretStr | None = None
+    webhook_tolerance: int = Field(default=300, ge=30, le=900)
 
     # Local HTTP API.
     http_host: str = "127.0.0.1"
@@ -93,6 +142,8 @@ class Settings(BaseSettings):
     notion_max_rps: float = Field(default=2.5, gt=0, le=100)
 
     _notion_origin: str = PrivateAttr(default="not set")
+    _ari_origin: str = PrivateAttr(default="not set")
+    _webhook_origin: str = PrivateAttr(default="not set")
 
     @field_validator("http_host")
     @classmethod
@@ -110,6 +161,10 @@ class Settings(BaseSettings):
         "api_token",
         "notion_token",
         "default_phone_region",
+        "ari_password",
+        "webhook_secret",
+        "caller_id",
+        "asterisk_answer_media",
         *NOTION_DB_SETTINGS,
         mode="before",
     )
@@ -160,6 +215,106 @@ class Settings(BaseSettings):
             raise ValueError("must be a two-letter country code such as AZ, RU or KZ")
         return value
 
+    @field_validator("call_regions")
+    @classmethod
+    def _check_call_regions(cls, value: str) -> str:
+        codes = sorted({part.strip().upper() for part in value.split(",") if part.strip()})
+        unknown = [code for code in codes if code not in SUPPORTED_REGIONS]
+        if unknown:
+            raise ValueError(
+                "unknown country code(s) " + ", ".join(unknown) + "; use ISO codes such as AZ,RU"
+            )
+        return ",".join(codes)
+
+    @field_validator("mock_scenario")
+    @classmethod
+    def _check_mock_scenario(cls, value: str) -> str:
+        if value not in MOCK_SCENARIOS:
+            raise ValueError("must be one of: " + ", ".join(MOCK_SCENARIOS))
+        return value
+
+    @field_validator("ari_url")
+    @classmethod
+    def _check_ari_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        if parts.scheme not in {"https", "http"} or not host:
+            raise ValueError("must be an http:// or https:// URL such as http://127.0.0.1:8088")
+        if parts.username or parts.password:
+            raise ValueError("must not contain a user name or password (use WEWLN_ARI_PASSWORD)")
+        if parts.path or parts.query or parts.fragment:
+            raise ValueError("must contain only the scheme, host and port (no /ari)")
+        if parts.scheme == "http" and not _is_loopback_host(host):
+            raise ValueError(
+                "plain http is allowed only on this computer (127.0.0.1; WSL2 forwards it); "
+                "use https:// for Asterisk on another machine"
+            )
+        return value
+
+    @field_validator("ari_username")
+    @classmethod
+    def _check_ari_username(cls, value: str) -> str:
+        if not _ARI_APP.match(value):
+            raise ValueError("must be 1-64 letters, digits, '_' or '-'")
+        return value
+
+    @field_validator("ari_password", "webhook_secret")
+    @classmethod
+    def _check_secret_shape(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None:
+            check_secret_format(value.get_secret_value())
+        return value
+
+    @field_validator("webhook_secret")
+    @classmethod
+    def _check_webhook_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < MIN_WEBHOOK_SECRET_LENGTH:
+            raise ValueError(f"must be at least {MIN_WEBHOOK_SECRET_LENGTH} characters long")
+        return value
+
+    @field_validator("ari_app")
+    @classmethod
+    def _check_ari_app(cls, value: str) -> str:
+        if not _ARI_APP.match(value):
+            raise ValueError("must be 1-64 letters, digits, '_' or '-'")
+        return value
+
+    @field_validator("asterisk_endpoint")
+    @classmethod
+    def _check_endpoint(cls, value: str) -> str:
+        value = value.strip()
+        if value.count("{number}") != 1 or not _DIAL_TEMPLATE.match(value):
+            raise ValueError(
+                "must look like PJSIP/{number}@wewln-trunk (one {number}, no spaces or '&')"
+            )
+        return value
+
+    @field_validator("asterisk_softphone_endpoint")
+    @classmethod
+    def _check_softphone(cls, value: str) -> str:
+        value = value.strip()
+        if not _SOFTPHONE.match(value):
+            raise ValueError("must be a local PJSIP endpoint such as PJSIP/softphone")
+        return value
+
+    @field_validator("asterisk_answer_media")
+    @classmethod
+    def _check_media(cls, value: str | None) -> str | None:
+        if value is not None and not _MEDIA.match(value.strip()):
+            raise ValueError("must be an Asterisk media URI such as sound:hello-world")
+        return value.strip() if value is not None else None
+
+    @field_validator("caller_id")
+    @classmethod
+    def _check_caller_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_phone(value.strip(), None)
+        if normalized.e164 is None:
+            raise ValueError("must be a phone number with the country code, e.g. +994121234567")
+        return normalized.e164
+
     @field_validator("api_token")
     @classmethod
     def _check_api_token(cls, value: SecretStr | None) -> SecretStr | None:
@@ -203,9 +358,39 @@ class Settings(BaseSettings):
                     + ", ".join(missing)
                     + " (create the databases with: wewln notion bootstrap --parent <page>)"
                 )
+        trunk = _TRUNK_OF.match(self.asterisk_endpoint)
+        if trunk and self.asterisk_softphone_endpoint == f"PJSIP/{trunk['trunk']}":
+            problems.append(
+                "WEWLN_ASTERISK_SOFTPHONE_ENDPOINT must be a local softphone, not the SIP trunk"
+            )
         if problems:
             raise ValueError(" | ".join(problems))
         return self
+
+    @property
+    def allowed_call_regions(self) -> frozenset[str]:
+        """Countries real calls may go to. Empty: none chosen (real calls stay blocked)."""
+        return frozenset(
+            part.strip().upper() for part in (self.call_regions or "").split(",") if part.strip()
+        )
+
+    @property
+    def ari_password_source(self) -> str:
+        return self._ari_origin if self.ari_password is not None else "not set"
+
+    @property
+    def webhook_secret_source(self) -> str:
+        return self._webhook_origin if self.webhook_secret is not None else "not set"
+
+    @property
+    def provider_problems(self) -> list[str]:
+        """What is missing for the configured provider to work at all (no secret values)."""
+        if self.telephony_provider == "asterisk" and self.ari_password is None:
+            return [
+                "WEWLN_TELEPHONY_PROVIDER=asterisk requires the ARI password: run "
+                "`wewln telephony secret set ari-password` or set WEWLN_ARI_PASSWORD"
+            ]
+        return []
 
     @property
     def is_loopback(self) -> bool:
@@ -237,7 +422,11 @@ class Settings(BaseSettings):
 
     def secret_values(self) -> list[str]:
         """Plain secret values, only so that logging can mask them."""
-        return [s.get_secret_value() for s in (self.api_token, self.notion_token) if s is not None]
+        return [
+            s.get_secret_value()
+            for s in (self.api_token, self.notion_token, self.ari_password, self.webhook_secret)
+            if s is not None
+        ]
 
     def redacted_summary(self) -> dict[str, Any]:
         """Settings safe to print or return over the API: secrets appear only as set / not set."""
@@ -270,6 +459,26 @@ class Settings(BaseSettings):
             "notion_api_base_url": self.notion_api_base_url,
             "notion_timeout": self.notion_timeout,
             "notion_max_rps": self.notion_max_rps,
+            "call_regions": self.call_regions or "not set",
+            "call_ring_timeout": self.call_ring_timeout,
+            "call_max_duration": self.call_max_duration,
+            "call_retry_delay": self.call_retry_delay,
+            "mock_scenario": self.mock_scenario,
+            "ari_url": self.ari_url,
+            "ari_username": self.ari_username,
+            "ari_password": (
+                f"set ({self.ari_password_source})" if self.ari_password else "not set"
+            ),
+            "ari_app": self.ari_app,
+            "asterisk_endpoint": self.asterisk_endpoint,
+            "asterisk_number_format": self.asterisk_number_format,
+            "asterisk_softphone_endpoint": self.asterisk_softphone_endpoint,
+            "asterisk_answer_media": self.asterisk_answer_media,
+            "caller_id": "set" if self.caller_id else "not set",
+            "webhook_secret": (
+                f"set ({self.webhook_secret_source})" if self.webhook_secret else "not set"
+            ),
+            "webhook_tolerance": self.webhook_tolerance,
         }
 
 
@@ -293,6 +502,22 @@ def check_notion_token_format(token: str) -> None:
         )
 
 
+def check_secret_format(value: str) -> None:
+    """Shape check for passwords and shared secrets (the value itself is never shown)."""
+    if any(ch.isspace() for ch in value):
+        raise ValueError("must not contain spaces or line breaks")
+    if not value or len(value) > MAX_SECRET_LENGTH:
+        raise ValueError(f"must be 1-{MAX_SECRET_LENGTH} characters long")
+
+
+def _origin(name: str, overrides: Mapping[str, Any]) -> str:
+    if name in overrides:
+        return "argument"
+    if any(k.upper() == f"{ENV_PREFIX}{name.upper()}" for k in os.environ):
+        return "environment variable"
+    return ".env file"
+
+
 def _describe(exc: ValidationError) -> list[str]:
     problems: list[str] = []
     for error in exc.errors(include_url=False, include_input=False):
@@ -312,33 +537,54 @@ def load_settings(
 ) -> Settings:
     """Load and validate settings. Raises ConfigError with readable problems (no secret values).
 
-    The Notion token is taken from (in order) explicit arguments, the environment, the .env file
-    and finally the OS credential store (`wewln notion token set`).
+    Secrets (Notion token, ARI password, webhook secret) are taken from (in order) explicit
+    arguments, the environment, the .env file and finally the OS credential store
+    (`wewln notion token set`, `wewln telephony secret set ...`).
     """
     try:
         settings = Settings(_env_file=env_file, **overrides)
     except ValidationError as exc:
         raise ConfigError(_describe(exc)) from None
-    if settings.notion_token is not None:
-        if "notion_token" in overrides:
-            settings._notion_origin = "argument"
-        elif any(k.upper() == f"{ENV_PREFIX}NOTION_TOKEN" for k in os.environ):
-            settings._notion_origin = "environment variable"
-        else:
-            settings._notion_origin = ".env file"
-    else:
-        store = secret_store if secret_store is not None else default_store()
+    store = secret_store if secret_store is not None else default_store()
+
+    def stored(key: str) -> str | None:
         try:
-            stored = store.get(NOTION_TOKEN_KEY)
+            return store.get(key)
         except SecretStoreUnavailable:
-            stored = None
-        if stored:
-            try:
-                check_notion_token_format(stored)
-            except ValueError as exc:
-                raise ConfigError([f"Notion token in the credential store: {exc}"]) from None
-            settings.notion_token = SecretStr(stored)
-            settings._notion_origin = "credential store"
+            return None
+
+    if settings.notion_token is not None:
+        settings._notion_origin = _origin("notion_token", overrides)
+    elif token := stored(NOTION_TOKEN_KEY):
+        try:
+            check_notion_token_format(token)
+        except ValueError as exc:
+            raise ConfigError([f"Notion token in the credential store: {exc}"]) from None
+        settings.notion_token = SecretStr(token)
+        settings._notion_origin = "credential store"
+
+    if settings.ari_password is not None:
+        settings._ari_origin = _origin("ari_password", overrides)
+    elif password := stored(ARI_PASSWORD_KEY):
+        try:
+            check_secret_format(password)
+        except ValueError as exc:
+            raise ConfigError([f"ARI password in the credential store: {exc}"]) from None
+        settings.ari_password = SecretStr(password)
+        settings._ari_origin = "credential store"
+
+    if settings.webhook_secret is not None:
+        settings._webhook_origin = _origin("webhook_secret", overrides)
+    elif secret := stored(WEBHOOK_SECRET_KEY):
+        try:
+            check_secret_format(secret)
+            if len(secret) < MIN_WEBHOOK_SECRET_LENGTH:
+                raise ValueError(f"must be at least {MIN_WEBHOOK_SECRET_LENGTH} characters long")
+        except ValueError as exc:
+            raise ConfigError([f"Webhook secret in the credential store: {exc}"]) from None
+        settings.webhook_secret = SecretStr(secret)
+        settings._webhook_origin = "credential store"
+
     if settings.notion_enabled and settings.notion_token is None:
         raise ConfigError(
             [

@@ -1,7 +1,8 @@
-"""Storage for the Notion token outside of files: the OS credential store via `keyring`.
+"""Secrets (Notion token, ARI password, webhook secret) outside of files: the OS credential store.
 
-On Windows this is the Credential Manager (protected by the user's Windows login). The backend is
-injectable so tests never touch the real store. Values are never logged or printed.
+The store is reached via `keyring`; on Windows this is the Credential Manager (protected by the
+user's Windows login). The backend is injectable so tests never touch the real store. Values are
+never logged or printed.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from typing import Any, Protocol
 
 SERVICE_NAME = "wewln-phonecaller"
 NOTION_TOKEN_KEY = "notion_token"  # noqa: S105 (the entry name, not a secret)
+ARI_PASSWORD_KEY = "ari_password"  # noqa: S105 (the entry name, not a secret)
+WEBHOOK_SECRET_KEY = "webhook_secret"  # noqa: S105 (the entry name, not a secret)
 
 
 class SecretStoreUnavailable(Exception):

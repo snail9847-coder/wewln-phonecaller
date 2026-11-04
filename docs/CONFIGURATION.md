@@ -17,12 +17,14 @@
 
 ## Переменные
 
+### Общие и Notion
+
 | Переменная | По умолчанию | Описание |
 | --- | --- | --- |
-| `WEWLN_MODE` | `simulation` | `simulation` или `production`. В этой версии реальных звонков нет ни в одном режиме |
+| `WEWLN_MODE` | `simulation` | `simulation` или `production`. Реальный звонок возможен только в `production` и только при всех условиях из [SECURITY.md](../SECURITY.md) |
 | `WEWLN_PRODUCTION_CONFIRM` | пусто | для `production` обязательна точная фраза `I_ACCEPT_REAL_CALLS` |
-| `WEWLN_KILL_SWITCH` | `false` | `true` блокирует любые реальные звонки |
-| `WEWLN_TELEPHONY_PROVIDER` | `mock` | провайдер телефонии; пока есть только `mock` (симуляция) |
+| `WEWLN_KILL_SWITCH` | `false` | `true` блокирует любые звонки. То же во время работы: `wewln calls stop-all` (снять — `wewln calls resume`) |
+| `WEWLN_TELEPHONY_PROVIDER` | `mock` | `mock` — симуляция; `asterisk` — свой Asterisk через ARI ([ASTERISK.md](ASTERISK.md)) |
 | `WEWLN_HTTP_HOST` | `127.0.0.1` | IP-адрес или `localhost`. Для адреса не из loopback обязателен `WEWLN_API_TOKEN` |
 | `WEWLN_HTTP_PORT` | `8787` | порт HTTP API (1–65535) |
 | `WEWLN_API_TOKEN` | не задан | Bearer-токен для `/api/...`, не короче 32 символов. Без токена защищённые эндпоинты закрыты |
@@ -46,6 +48,44 @@
 | `WEWLN_NOTION_TIMEOUT` | `30` | секунд на один запрос к Notion (1–300) |
 | `WEWLN_NOTION_API_BASE_URL` | `https://api.notion.com` | адрес API. Менять только для имитации (`wewln notion mock-server`): `http://` разрешён лишь для `127.0.0.1` и `localhost` |
 
+### Звонки
+
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `WEWLN_CALL_REGIONS` | пусто | страны, в которые можно звонить: коды ISO через запятую (`AZ` или `AZ,RU`). Номера других стран не набираются. Для реальных звонков обязательна. Верный номер +7 или +994 не доказывает, что он доступен и что на него можно звонить |
+| `WEWLN_CALL_RING_TIMEOUT` | `30` | секунд звонка без ответа, после которых wewln кладёт трубку: «нет ответа» (5–120) |
+| `WEWLN_CALL_MAX_DURATION` | `300` | самый долгий разговор в секундах, затем wewln завершает звонок (10–3600) |
+| `WEWLN_CALL_RETRY_DELAY` | `900` | секунд до следующей попытки после «занято» или «нет ответа» (60–86400). Число попыток — «Макс. попыток» кампании (1–5) |
+| `WEWLN_MOCK_SCENARIO` | `answer` | поведение `mock`: `answer`, `busy`, `no_answer`, `reject`, `unreachable`, `fail`, `silent`, `answer_hold` или `mixed` (по последней цифре номера) |
+| `WEWLN_CALLER_ID` | не задан | номер, который передаётся при звонке (E.164, например `+994121234567`). Только ваш номер у провайдера; провайдер может заменить его своим |
+
+Номера платных и похожих служб (premium rate, shared cost) не набираются никогда.
+
+### Asterisk
+
+Нужны только при `WEWLN_TELEPHONY_PROVIDER=asterisk`. Настройка Asterisk — [ASTERISK.md](ASTERISK.md).
+
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `WEWLN_ARI_URL` | `http://127.0.0.1:8088` | адрес ARI: только схема, хост и порт (без `/ari`). `http://` разрешён лишь на этом компьютере (WSL2 пробрасывает `127.0.0.1`), для другого компьютера — `https://` |
+| `WEWLN_ARI_USERNAME` | `wewln` | пользователь ARI из `ari.conf` |
+| `WEWLN_ARI_PASSWORD` | не задан | пароль ARI. Лучше хранить в Диспетчере учётных данных Windows: `wewln telephony secret set ari-password` |
+| `WEWLN_ARI_APP` | `wewln` | имя приложения Stasis; на этом Asterisk его не должно использовать ничто другое |
+| `WEWLN_ASTERISK_ENDPOINT` | `PJSIP/{number}@wewln-trunk` | как набирать номер: `{number}` заменяется номером в формате `WEWLN_ASTERISK_NUMBER_FORMAT` |
+| `WEWLN_ASTERISK_NUMBER_FORMAT` | `e164` | какой формат ждёт провайдер: `e164` (`+994501234567`), `digits` (`994501234567`) или `00` (`00994501234567`) |
+| `WEWLN_ASTERISK_SOFTPHONE_ENDPOINT` | `PJSIP/softphone` | локальный софтфон (MicroSIP) для бесплатной проверки без телефонной сети: `wewln calls test --softphone`. Не может совпадать с SIP-транком |
+| `WEWLN_ASTERISK_ANSWER_MEDIA` | `sound:hello-world` | что проиграть после ответа, пока нет голосового движка (фаза 5). Пусто — сразу положить трубку |
+
+### Вебхуки статусов звонков
+
+Необязательны: нужны только провайдеру, который сообщает о ходе звонка по HTTP.
+Формат и защита — в [SECURITY.md](../SECURITY.md).
+
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `WEWLN_WEBHOOK_SECRET` | не задан | ключ подписи HMAC-SHA256, не короче 32 символов. Пока не задан, `POST /api/v1/telephony/events` закрыт. Создать и сохранить: `wewln telephony secret set webhook-secret --generate --show` |
+| `WEWLN_WEBHOOK_TOLERANCE` | `300` | допустимая разница часов в секундах (30–900): более старые запросы отклоняются |
+
 Относительные пути считаются от папки, из которой запущена программа.
 
 ID баз печатает и при желании сам записывает в `.env` команда
@@ -54,12 +94,16 @@ ID баз печатает и при желании сам записывает 
 
 ## Секреты
 
-- `WEWLN_API_TOKEN` и `WEWLN_NOTION_TOKEN` хранятся как `SecretStr`. В выводе `check-config`,
-  в `/api/v1/info` и в логах вместо значения стоит только `set` или `not set`.
+- `WEWLN_API_TOKEN`, `WEWLN_NOTION_TOKEN`, `WEWLN_ARI_PASSWORD` и `WEWLN_WEBHOOK_SECRET`
+  хранятся как `SecretStr`. В выводе `check-config`, в `/api/v1/info` и в логах вместо значения
+  стоит только `set` или `not set`.
 - Токен Notion ищется по порядку: переменная окружения `WEWLN_NOTION_TOKEN` → строка в `.env` →
   Диспетчер учётных данных Windows (запись `wewln-phonecaller`, команда
   `wewln notion token set`). `check-config` и `wewln notion token status` показывают источник:
   `set (environment variable)`, `set (.env file)` или `set (credential store)`.
+- Пароль ARI и ключ вебхуков ищутся так же: окружение → `.env` → Диспетчер учётных данных
+  (`wewln telephony secret set ari-password` и `wewln telephony secret set webhook-secret`).
+  Источник показывает `wewln telephony secret status`; удалить — `wewln telephony secret delete`.
 - Токен проверяется только по виду (без пробелов, разумная длина); неверный токен Notion
   отклонит при первом запросе, и `wewln notion check` об этом скажет.
 - Пустое значение (`WEWLN_API_TOKEN=`) означает «не задан».

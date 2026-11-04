@@ -46,13 +46,13 @@ from ..domain import (
 )
 from ..errors import WewlnError
 from ..phones import PHONE_ERROR_TEXT_RU, normalize_phone
+from ..safety import evaluate_real_calls
 from ..storage.repository import (
     NotionCampaignRecord,
     NotionContactRecord,
     Repository,
     campaign_status_label,
 )
-from ..telephony import PROVIDERS
 from . import props
 from .client import (
     NotionAccessError,
@@ -201,7 +201,8 @@ class NotionSync:
         self._clock = clock
         self._running = asyncio.Lock()
         self._lock_renewed = 0.0
-        self._simulated = not PROVIDERS[settings.telephony_provider].places_real_calls
+        # Campaign calls are simulated unless real calls are allowed (never in this version).
+        self._simulated = not evaluate_real_calls(settings).allowed
         self.last_result: SyncResult | None = None
         self.last_success_at: str | None = None
         self.consecutive_failures = 0
