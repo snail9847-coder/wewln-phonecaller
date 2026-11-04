@@ -6,6 +6,7 @@ Validation runs at startup; an invalid configuration stops the program (fail clo
 
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import os
 import re
@@ -36,6 +37,7 @@ from .secret_store import (
     SecretStoreUnavailable,
     default_store,
 )
+from .voice.phrases import DEFAULT_GOODBYE, DEFAULT_GREETING, DEFAULT_TEST_SCRIPT
 
 ENV_PREFIX = "WEWLN_"
 PRODUCTION_CONFIRM_PHRASE = "I_ACCEPT_REAL_CALLS"
@@ -68,6 +70,16 @@ _DIAL_TEMPLATE = re.compile(r"^[A-Za-z]{2,16}/[A-Za-z0-9_.@/+{}-]{1,180}$")
 _SOFTPHONE = re.compile(r"^PJSIP/[A-Za-z0-9_-]{1,64}$")
 _MEDIA = re.compile(r"^(sound|recording|tone|digits|number):[A-Za-z0-9_/,.-]{1,100}$")
 _TRUNK_OF = re.compile(r"^PJSIP/\{number\}@(?P<trunk>[A-Za-z0-9_.-]+)$")
+_ADVERTISE = re.compile(r"^(?P<host>[A-Za-z0-9.-]{1,253})(:(?P<port>[0-9]{1,5}))?$")
+# Model files looked up in <data dir>/models when no path is given (docs/VOICE.md).
+DEFAULT_VOSK_MODEL = "vosk-model-small-ru-0.22"
+DEFAULT_PIPER_VOICE = "ru_RU-denis-medium.onnx"
+DEFAULT_WHISPER_MODEL = "small"
+VOICE_PACKAGES = {
+    "vosk": ("vosk", "vosk"),
+    "faster-whisper": ("faster_whisper", "whisper"),
+    "piper": ("piper", "piper"),
+}
 
 
 class Settings(BaseSettings):
@@ -104,6 +116,47 @@ class Settings(BaseSettings):
     asterisk_softphone_endpoint: str = "PJSIP/softphone"
     asterisk_answer_media: str | None = "sound:hello-world"
     caller_id: str | None = None
+
+    # The voice engine (docs/VOICE.md). off: an answered call hears WEWLN_ASTERISK_ANSWER_MEDIA
+    # and ends. ai: a spoken conversation; speech, text and the dialogue model stay on this
+    # computer (or on a machine in the local network you choose).
+    voice_mode: Literal["off", "ai"] = "off"
+    voice_stt: Literal["vosk", "faster-whisper", "whisper-http"] = "vosk"
+    voice_stt_model: str = ""
+    voice_stt_url: str = "http://127.0.0.1:8080"
+    voice_stt_device: Literal["cpu", "cuda", "auto"] = "cpu"
+    voice_stt_compute_type: Literal["int8", "int8_float16", "float16", "float32", "default"] = (
+        "int8"
+    )
+    voice_llm: Literal["ollama", "openai"] = "ollama"
+    voice_llm_url: str = "http://127.0.0.1:11434"
+    voice_llm_model: str = "qwen3:4b"
+    voice_llm_api_key: SecretStr | None = None
+    voice_llm_temperature: float = Field(default=0.5, ge=0, le=1.5)
+    voice_llm_max_tokens: int = Field(default=160, ge=32, le=1024)
+    voice_llm_timeout: float = Field(default=15.0, ge=2, le=120)
+    voice_llm_think: bool = False
+    voice_tts: Literal["piper", "piper-http"] = "piper"
+    voice_tts_model: str = ""
+    voice_tts_url: str = "http://127.0.0.1:5000"
+    voice_tts_speaker: int | None = Field(default=None, ge=0, le=10000)
+    voice_tts_length_scale: float = Field(default=1.0, ge=0.5, le=2.0)
+    voice_allow_downloads: bool = False
+    voice_greeting: str = DEFAULT_GREETING
+    voice_goodbye: str = DEFAULT_GOODBYE
+    voice_test_script: str = DEFAULT_TEST_SCRIPT
+    voice_max_turns: int = Field(default=12, ge=1, le=40)
+    voice_no_input_timeout: float = Field(default=8.0, ge=3, le=60)
+    voice_end_silence_ms: int = Field(default=700, ge=300, le=3000)
+    voice_barge_in: bool = True
+    # Where Asterisk sends the call audio (AudioSocket over TCP). Advertise: the address
+    # Asterisk reaches this computer at, when it differs (WSL2 in NAT mode, docs/ASTERISK.md).
+    voice_audiosocket_host: str = "127.0.0.1"
+    voice_audiosocket_port: int = Field(default=9092, ge=1024, le=65535)
+    voice_audiosocket_advertise: str = ""
+    # Conversation transcripts in the local database (deleted after the given number of days).
+    voice_store_transcripts: bool = True
+    voice_transcript_days: int = Field(default=30, ge=1, le=3650)
 
     # Signed call-status webhooks (POST /api/v1/telephony/events). Closed while no secret is set.
     webhook_secret: SecretStr | None = None
@@ -145,7 +198,7 @@ class Settings(BaseSettings):
     _ari_origin: str = PrivateAttr(default="not set")
     _webhook_origin: str = PrivateAttr(default="not set")
 
-    @field_validator("http_host")
+    @field_validator("http_host", "voice_audiosocket_host")
     @classmethod
     def _check_host(cls, value: str) -> str:
         value = value.strip()
@@ -165,6 +218,8 @@ class Settings(BaseSettings):
         "webhook_secret",
         "caller_id",
         "asterisk_answer_media",
+        "voice_llm_api_key",
+        "voice_tts_speaker",
         *NOTION_DB_SETTINGS,
         mode="before",
     )
@@ -259,7 +314,61 @@ class Settings(BaseSettings):
             raise ValueError("must be 1-64 letters, digits, '_' or '-'")
         return value
 
-    @field_validator("ari_password", "webhook_secret")
+    @field_validator("voice_stt_url", "voice_llm_url", "voice_tts_url")
+    @classmethod
+    def _check_voice_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        if parts.scheme not in {"https", "http"} or not host:
+            raise ValueError("must be an http:// or https:// URL such as http://127.0.0.1:11434")
+        if parts.username or parts.password:
+            raise ValueError("must not contain a user name or password")
+        if parts.query or parts.fragment:
+            raise ValueError("must not contain a query (?) or fragment (#)")
+        if parts.scheme == "http" and not _is_local_network_host(host):
+            raise ValueError(
+                "plain http is allowed only on this computer or in the local network "
+                "(127.0.0.1, 192.168.x.x, 10.x.x.x); use https:// for another server"
+            )
+        return value
+
+    @field_validator("voice_stt_model", "voice_tts_model", "voice_llm_model")
+    @classmethod
+    def _check_model_name(cls, value: str) -> str:
+        value = value.strip().strip('"')
+        if len(value) > 500 or any(ch in value for ch in "\r\n\t"):
+            raise ValueError("must be a model name or a path on one line")
+        return value
+
+    @field_validator("voice_greeting", "voice_goodbye")
+    @classmethod
+    def _check_phrase(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not 2 <= len(value) <= 400:
+            raise ValueError("must be a phrase of 2-400 characters")
+        return value
+
+    @field_validator("voice_test_script")
+    @classmethod
+    def _check_script(cls, value: str) -> str:
+        value = value.strip()
+        if not 10 <= len(value) <= 4000:
+            raise ValueError("must be a task description of 10-4000 characters")
+        return value
+
+    @field_validator("voice_audiosocket_advertise")
+    @classmethod
+    def _check_advertise(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return value
+        match = _ADVERTISE.match(value)
+        if not match or (match["port"] and not 1 <= int(match["port"]) <= 65535):
+            raise ValueError("must be host or host:port, e.g. 172.24.160.1:9092")
+        return value
+
+    @field_validator("ari_password", "webhook_secret", "voice_llm_api_key")
     @classmethod
     def _check_secret_shape(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None:
@@ -363,6 +472,14 @@ class Settings(BaseSettings):
             problems.append(
                 "WEWLN_ASTERISK_SOFTPHONE_ENDPOINT must be a local softphone, not the SIP trunk"
             )
+        wildcard = self.voice_audiosocket_host in ("0.0.0.0", "::")  # noqa: S104 - checked
+        if wildcard and not self.voice_audiosocket_advertise:
+            problems.append(
+                "WEWLN_VOICE_AUDIOSOCKET_HOST listens on every interface: set "
+                "WEWLN_VOICE_AUDIOSOCKET_ADVERTISE to the address Asterisk reaches this computer at"
+            )
+        if self.voice_mode == "ai" and self.voice_audiosocket_port == self.http_port:
+            problems.append("WEWLN_VOICE_AUDIOSOCKET_PORT must differ from WEWLN_HTTP_PORT")
         if problems:
             raise ValueError(" | ".join(problems))
         return self
@@ -391,6 +508,69 @@ class Settings(BaseSettings):
                 "`wewln telephony secret set ari-password` or set WEWLN_ARI_PASSWORD"
             ]
         return []
+
+    @property
+    def voice_enabled(self) -> bool:
+        return self.voice_mode == "ai"
+
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
+    def resolved_stt_model(self) -> str:
+        """The speech recognition model: a folder (Vosk), a size or folder (faster-whisper)."""
+        if self.voice_stt_model:
+            return self.voice_stt_model
+        if self.voice_stt == "vosk":
+            return str(self.models_dir / DEFAULT_VOSK_MODEL)
+        return DEFAULT_WHISPER_MODEL if self.voice_stt == "faster-whisper" else ""
+
+    @property
+    def resolved_tts_model(self) -> str:
+        if self.voice_tts_model:
+            return self.voice_tts_model
+        return str(self.models_dir / DEFAULT_PIPER_VOICE) if self.voice_tts == "piper" else ""
+
+    @property
+    def audiosocket_advertise(self) -> str:
+        """host:port that Asterisk connects to for the call audio."""
+        value = self.voice_audiosocket_advertise
+        if not value:
+            return f"{self.voice_audiosocket_host}:{self.voice_audiosocket_port}"
+        return value if ":" in value else f"{value}:{self.voice_audiosocket_port}"
+
+    @property
+    def voice_problems(self) -> list[str]:
+        """What is missing for WEWLN_VOICE_MODE=ai (quick checks: packages and model files)."""
+        if not self.voice_enabled:
+            return []
+        problems: list[str] = []
+        for backend in (self.voice_stt, self.voice_tts):
+            module, extra = VOICE_PACKAGES.get(backend, ("", ""))
+            if module and importlib.util.find_spec(module) is None:
+                problems.append(
+                    f'{backend} is not installed: pip install "wewln-phonecaller[{extra}]"'
+                )
+        if self.voice_stt == "vosk":
+            model = Path(self.resolved_stt_model)
+            if not (model / "am").is_dir() and not (model / "conf").is_dir():
+                problems.append(
+                    f"WEWLN_VOICE_STT_MODEL: no Vosk model folder at {model} "
+                    "(download it with: wewln voice download vosk)"
+                )
+        elif self.voice_stt == "faster-whisper":
+            model = self.resolved_stt_model
+            if ("/" in model or "\\" in model) and not Path(model).is_dir():
+                problems.append(f"WEWLN_VOICE_STT_MODEL: no faster-whisper model folder at {model}")
+        if self.voice_tts == "piper":
+            voice = Path(self.resolved_tts_model)
+            if not voice.is_file() or not Path(f"{voice}.json").is_file():
+                problems.append(
+                    f"WEWLN_VOICE_TTS_MODEL: no Piper voice at {voice} (the .onnx file and its "
+                    ".onnx.json; download them with: wewln voice download piper)"
+                )
+        return problems
 
     @property
     def is_loopback(self) -> bool:
@@ -424,7 +604,13 @@ class Settings(BaseSettings):
         """Plain secret values, only so that logging can mask them."""
         return [
             s.get_secret_value()
-            for s in (self.api_token, self.notion_token, self.ari_password, self.webhook_secret)
+            for s in (
+                self.api_token,
+                self.notion_token,
+                self.ari_password,
+                self.webhook_secret,
+                self.voice_llm_api_key,
+            )
             if s is not None
         ]
 
@@ -479,6 +665,26 @@ class Settings(BaseSettings):
                 f"set ({self.webhook_secret_source})" if self.webhook_secret else "not set"
             ),
             "webhook_tolerance": self.webhook_tolerance,
+            "voice_mode": self.voice_mode,
+            "voice_stt": self.voice_stt,
+            "voice_stt_model": self.resolved_stt_model or None,
+            "voice_stt_url": self.voice_stt_url if self.voice_stt == "whisper-http" else None,
+            "voice_llm": self.voice_llm,
+            "voice_llm_url": self.voice_llm_url,
+            "voice_llm_model": self.voice_llm_model,
+            "voice_llm_api_key": "set" if self.voice_llm_api_key else "not set",
+            "voice_llm_think": self.voice_llm_think,
+            "voice_tts": self.voice_tts,
+            "voice_tts_model": self.resolved_tts_model or None,
+            "voice_tts_url": self.voice_tts_url if self.voice_tts == "piper-http" else None,
+            "voice_allow_downloads": self.voice_allow_downloads,
+            "voice_max_turns": self.voice_max_turns,
+            "voice_no_input_timeout": self.voice_no_input_timeout,
+            "voice_barge_in": self.voice_barge_in,
+            "voice_audiosocket": f"{self.voice_audiosocket_host}:{self.voice_audiosocket_port}",
+            "voice_audiosocket_advertise": self.audiosocket_advertise,
+            "voice_store_transcripts": self.voice_store_transcripts,
+            "voice_transcript_days": self.voice_transcript_days,
         }
 
 
@@ -489,6 +695,17 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _is_local_network_host(host: str) -> bool:
+    """This computer or a private (local network) address; never a public one."""
+    if _is_loopback_host(host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private and not address.is_unspecified and not address.is_multicast
 
 
 def check_notion_token_format(token: str) -> None:
