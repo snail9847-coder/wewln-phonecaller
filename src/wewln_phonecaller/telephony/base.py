@@ -12,7 +12,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..voice.transport import MediaStream
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,13 @@ class ProviderRejectedError(ProviderError):
     retryable = False
 
 
+class MediaError(ProviderError):
+    """The call's audio could not be connected to wewln (the call itself may live on)."""
+
+    code = "media_failed"
+    retryable = False
+
+
 class ProviderUncertainError(ProviderError):
     """The request may have reached the provider, but no answer arrived."""
 
@@ -107,6 +117,25 @@ EventSink = Callable[[ProviderEvent], Awaitable[None]]
 
 class TelephonyProvider(ABC):
     info: ProviderInfo
+    # Whether the provider can connect a call's audio to wewln (the voice engine, Phase 5).
+    supports_media: bool = False
+    media_enabled: bool = False
+
+    def enable_media(self) -> None:
+        """Answered calls get their audio connected by open_media() instead of the fixed
+        answer media. Called before start()."""
+        if not self.supports_media:
+            raise MediaError(
+                f"the {self.info.name} provider cannot carry call audio", code="media_unsupported"
+            )
+        self.media_enabled = True
+
+    async def open_media(self, call_id: str) -> MediaStream:
+        """Connect the answered call's audio to wewln (8 kHz 16-bit mono PCM both ways).
+        Raises MediaError; the call service then ends the call."""
+        raise MediaError(
+            f"the {self.info.name} provider cannot carry call audio", code="media_unsupported"
+        )
 
     @abstractmethod
     async def start(self, sink: EventSink) -> None:

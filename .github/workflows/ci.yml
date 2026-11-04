@@ -62,6 +62,70 @@ jobs:
       - name: CLI check-config
         run: python -m wewln_phonecaller check-config
 
+  voice-models:
+    # The voice engine with the real models: Piper speaks, Vosk recognizes at 8 kHz (as on a
+    # phone line), a conversation runs through the engine. The models come from
+    # `wewln voice download` (sizes and SHA-256 checked) and are cached; the dialogue model is
+    # a fake, so no Ollama is needed.
+    name: ${{ matrix.os }} / voice models (Vosk, Piper)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      WEWLN_DATA_DIR: ${{ github.workspace }}/.voice-models
+      WEWLN_LOG_TO_FILE: "false"
+      # Russian text in the logs (pytest -s prints what was said and heard).
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install with the voice extras
+        run: python -m pip install -e ".[dev,voice]"
+
+      - name: Model cache
+        uses: actions/cache@v6
+        with:
+          path: .voice-models/models
+          key: voice-models-vosk-small-ru-0.22-piper-denis-e7229f7
+
+      - name: Download the models (sizes and SHA-256 checked)
+        run: python -m wewln_phonecaller voice download all 2>&1 | tee voice-download.log
+
+      - name: wewln voice check (without the dialogue model)
+        run: python -m wewln_phonecaller voice check --no-llm 2>&1 | tee voice-check.log
+
+      - name: Tests with the real models
+        env:
+          WEWLN_TEST_MODELS_DIR: ${{ github.workspace }}/.voice-models/models
+          WEWLN_TEST_MODELS_REQUIRED: "1"
+        run: |
+          python -m pytest -q -m voice_models -p no:cacheprovider -rA -s --tb=short \
+            2>&1 | tee pytest-voice.log
+
+      - name: Results as annotations (readable on the run page)
+        if: always()
+        run: python .github/scripts/annotate.py --notice voice-check.log pytest-voice.log
+
+      - name: Failure details as annotations
+        if: failure()
+        run: >-
+          python .github/scripts/annotate.py
+          voice-download.log voice-check.log pytest-voice.log
+
   asterisk-live:
     # A real Asterisk from Ubuntu's packages (24.04: Asterisk 20 LTS, 26.04: Asterisk 22 LTS),
     # driven over ARI. Calls go to Local channels of a test dialplan: no SIP account, no phone
