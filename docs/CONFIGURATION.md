@@ -74,7 +74,38 @@
 | `WEWLN_ASTERISK_ENDPOINT` | `PJSIP/{number}@wewln-trunk` | как набирать номер: `{number}` заменяется номером в формате `WEWLN_ASTERISK_NUMBER_FORMAT` |
 | `WEWLN_ASTERISK_NUMBER_FORMAT` | `e164` | какой формат ждёт провайдер: `e164` (`+994501234567`), `digits` (`994501234567`) или `00` (`00994501234567`) |
 | `WEWLN_ASTERISK_SOFTPHONE_ENDPOINT` | `PJSIP/softphone` | локальный софтфон (MicroSIP) для бесплатной проверки без телефонной сети: `wewln calls test --softphone`. Не может совпадать с SIP-транком |
-| `WEWLN_ASTERISK_ANSWER_MEDIA` | `sound:hello-world` | что проиграть после ответа, пока нет голосового движка (фаза 5). Пусто — сразу положить трубку |
+| `WEWLN_ASTERISK_ANSWER_MEDIA` | `sound:hello-world` | что проиграть после ответа при `WEWLN_VOICE_MODE=off`. Пусто — сразу положить трубку |
+
+### Голосовой движок
+
+Устройство, установка и проверка — [VOICE.md](VOICE.md).
+
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `WEWLN_VOICE_MODE` | `off` | `off` — после ответа звучит `WEWLN_ASTERISK_ANSWER_MEDIA`; `ai` — голосовой разговор. Без моделей дозвонщик с `ai` не запускается |
+| `WEWLN_VOICE_STT` | `vosk` | распознавание: `vosk`, `faster-whisper` или `whisper-http` (сервер whisper.cpp) |
+| `WEWLN_VOICE_STT_MODEL` | пусто | Vosk — папка модели; faster-whisper — размер (`small`, `medium`, `large-v3`) или папка. Пусто: `<DATA_DIR>/models/vosk-model-small-ru-0.22` или `small` |
+| `WEWLN_VOICE_STT_URL` | `http://127.0.0.1:8080` | адрес сервера whisper.cpp |
+| `WEWLN_VOICE_STT_DEVICE` · `_COMPUTE_TYPE` | `cpu` · `int8` | только faster-whisper: `cpu`, `cuda`, `auto`; `int8` для CPU, `float16` для видеокарты |
+| `WEWLN_VOICE_ALLOW_DOWNLOADS` | `false` | модели сами не скачиваются; `true` разрешает faster-whisper один раз скачать свою |
+| `WEWLN_VOICE_LLM` | `ollama` | диалоговая модель: `ollama` или `openai` (локальный сервер с API OpenAI: llama.cpp, LM Studio) |
+| `WEWLN_VOICE_LLM_URL` | `http://127.0.0.1:11434` | адрес сервера. `http://` — только этот компьютер и локальная сеть, иначе `https://` |
+| `WEWLN_VOICE_LLM_MODEL` | `qwen3:4b` | модель (для Ollama — уже скачанная: `ollama pull qwen3:4b`) |
+| `WEWLN_VOICE_LLM_API_KEY` | не задан | ключ, если сервер его требует; хранится как секрет |
+| `WEWLN_VOICE_LLM_TEMPERATURE` · `_MAX_TOKENS` · `_TIMEOUT` | `0.5` · `160` · `15` | разнообразие ответов (0–1,5), предел длины ответа (32–1024), секунд до первых слов (2–120) |
+| `WEWLN_VOICE_LLM_THINK` | `false` | режим размышлений моделей вроде Qwen3; выключенный отвечает намного быстрее |
+| `WEWLN_VOICE_TTS` | `piper` | синтез: `piper` (файл голоса) или `piper-http` (`python -m piper.http_server`) |
+| `WEWLN_VOICE_TTS_MODEL` | пусто | файл голоса `.onnx` (рядом — `.onnx.json`). Пусто: `<DATA_DIR>/models/ru_RU-denis-medium.onnx` |
+| `WEWLN_VOICE_TTS_URL` · `_SPEAKER` · `_LENGTH_SCALE` | `http://127.0.0.1:5000` · не задан · `1.0` | сервер Piper, номер диктора многоголосых моделей, темп (1,2 — медленнее, 0,9 — быстрее) |
+| `WEWLN_VOICE_GREETING` · `_GOODBYE` | см. `.env.example` | первая и последняя фраза разговора (2–400 символов) |
+| `WEWLN_VOICE_TEST_SCRIPT` | см. `.env.example` | задача тестового звонка (10–4000 символов); звонки кампаний берут «Сценарий» кампании |
+| `WEWLN_VOICE_MAX_TURNS` | `12` | реплик собеседника за звонок (1–40), затем прощание |
+| `WEWLN_VOICE_NO_INPUT_TIMEOUT` | `8` | секунд тишины до «Алло? Вы меня слышите?» (3–60) |
+| `WEWLN_VOICE_END_SILENCE_MS` | `700` | пауза, которая заканчивает реплику (300–3000 мс) |
+| `WEWLN_VOICE_BARGE_IN` | `true` | собеседник может перебить wewln |
+| `WEWLN_VOICE_AUDIOSOCKET_HOST` · `_PORT` | `127.0.0.1` · `9092` | где wewln принимает звук звонка от Asterisk. Asterisk в WSL2 с сетью NAT: адрес адаптера WSL в Windows ([ASTERISK.md](ASTERISK.md), шаг 6а). Порт не равен `WEWLN_HTTP_PORT` |
+| `WEWLN_VOICE_AUDIOSOCKET_ADVERTISE` | пусто | адрес, к которому подключается Asterisk, если он не `HOST:PORT`; обязателен при `HOST=0.0.0.0` |
+| `WEWLN_VOICE_STORE_TRANSCRIPTS` · `_TRANSCRIPT_DAYS` | `true` · `30` | хранить ли текст разговоров в локальной базе и сколько дней (1–3650) |
 
 ### Вебхуки статусов звонков
 
@@ -94,8 +125,8 @@ ID баз печатает и при желании сам записывает 
 
 ## Секреты
 
-- `WEWLN_API_TOKEN`, `WEWLN_NOTION_TOKEN`, `WEWLN_ARI_PASSWORD` и `WEWLN_WEBHOOK_SECRET`
-  хранятся как `SecretStr`. В выводе `check-config`, в `/api/v1/info` и в логах вместо значения
+- `WEWLN_API_TOKEN`, `WEWLN_NOTION_TOKEN`, `WEWLN_ARI_PASSWORD`, `WEWLN_WEBHOOK_SECRET` и
+  `WEWLN_VOICE_LLM_API_KEY` хранятся как `SecretStr`. В выводе `check-config`, в `/api/v1/info` и в логах вместо значения
   стоит только `set` или `not set`.
 - Токен Notion ищется по порядку: переменная окружения `WEWLN_NOTION_TOKEN` → строка в `.env` →
   Диспетчер учётных данных Windows (запись `wewln-phonecaller`, команда

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..config import Settings
 from ..errors import ConfigError
 from ..storage import Database
@@ -9,15 +11,25 @@ from ..storage.calls import CallStore
 from ..storage.repository import Repository
 from .asterisk import AriConfig, AsteriskAriProvider
 from .base import TelephonyProvider
-from .mock import MockTelephonyProvider
+from .mock import MockCaller, MockTelephonyProvider
 from .service import CallService
+
+if TYPE_CHECKING:
+    from ..voice.runtime import VoiceRuntime
 
 
 def create_provider(
-    settings: Settings, *, scenario: str | None = None, time_scale: float = 1.0
+    settings: Settings,
+    *,
+    scenario: str | None = None,
+    time_scale: float = 1.0,
+    caller: MockCaller | None = None,
 ) -> TelephonyProvider:
+    """The configured provider. `caller`: the simulated person on answered mock calls."""
     if settings.telephony_provider == "mock":
-        return MockTelephonyProvider(scenario or settings.mock_scenario, time_scale=time_scale)
+        return MockTelephonyProvider(
+            scenario or settings.mock_scenario, time_scale=time_scale, caller=caller
+        )
     if settings.telephony_provider == "asterisk":
         if settings.provider_problems or settings.ari_password is None:
             raise ConfigError(settings.provider_problems)
@@ -31,6 +43,9 @@ def create_provider(
                 number_format=settings.asterisk_number_format,
                 caller_id=settings.caller_id,
                 answer_media=settings.asterisk_answer_media,
+                media_host=settings.voice_audiosocket_host,
+                media_port=settings.voice_audiosocket_port,
+                media_advertise=settings.audiosocket_advertise,
             )
         )
     raise ConfigError([f"unknown telephony provider {settings.telephony_provider!r}"])
@@ -56,9 +71,11 @@ def create_call_service(
     provider: TelephonyProvider | None = None,
     scenario: str | None = None,
     time_scale: float = 1.0,
+    voice: VoiceRuntime | None = None,
 ) -> CallService:
     return CallService(
         settings,
         create_call_store(settings, db),
         provider or create_provider(settings, scenario=scenario, time_scale=time_scale),
+        voice=voice,
     )
