@@ -259,7 +259,10 @@ async def test_a_request_without_an_answer_is_not_repeated(ari_sim):
         ari_sim.post_behavior = "error"
         with pytest.raises(ProviderError) as error:
             await provider.place_call(request("wewln-" + "2" * 32))
-        assert error.value.code == "ari_server_error"
+        assert error.value.code == "ari_server_error"  # no channel: certainly no call
+        ari_sim.get_behavior = "error"
+        with pytest.raises(ProviderUncertainError):  # an error, and no way to look
+            await provider.place_call(request("wewln-" + "3" * 32))
     finally:
         await provider.close()
 
@@ -332,6 +335,26 @@ async def test_emergency_stop_while_asterisk_creates_the_channel(ari_world, ari_
     assert (outcome.state, outcome.end_reason) == (CallState.CANCELLED, "kill_switch")
     assert deletes() == 1
     assert ari_sim.channels == {}
+
+
+async def test_ctrl_c_while_asterisk_creates_the_channel_ends_the_call(ari_world, ari_sim):
+    # Asterisk creates the channel only after a while and Ctrl+C comes before that: wewln
+    # waits for the answer to its dial request, then hangs up. No call rings on unseen.
+    ari_sim.default_scenario = "ringing"
+    ari_sim.post_behavior = "slow_create"
+    ari_sim.post_delay = 0.5
+    w = ari_world()
+    w.store.create_permit(PHONE, minutes=5)
+    async with w.service:
+        task = asyncio.create_task(w.service.test_call(to_e164=PHONE))
+        await until(lambda: len(posts(ari_sim)) == 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await asyncio.sleep(ari_sim.post_delay + 0.2)
+    assert ari_sim.channels == {}
+    (attempt,) = w.store.list_attempts()
+    assert (attempt["state"], attempt["end_reason"]) == ("cancelled", "interrupted")
 
 
 async def test_restart_ends_a_call_still_live_in_asterisk(ari_world, ari_sim):

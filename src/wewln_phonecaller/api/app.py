@@ -390,6 +390,18 @@ async def calls_stop_all(request: web.Request) -> web.Response:
     )
 
 
+async def _read_body(request: web.Request, limit: int) -> bytes:
+    """The whole body (it may arrive in many pieces), refused with 413 beyond `limit`."""
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := await request.content.read(64 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=size)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def telephony_events(request: web.Request) -> web.Response:
     """Signed call-status events (HMAC, see telephony/webhooks.py). Each event applies once."""
     settings = request.app[SETTINGS_KEY]
@@ -399,9 +411,7 @@ async def telephony_events(request: web.Request) -> web.Response:
         raise web.HTTPRequestEntityTooLarge(
             max_size=MAX_BODY_BYTES, actual_size=request.content_length
         )
-    body = await request.content.read(MAX_BODY_BYTES + 1)
-    if len(body) > MAX_BODY_BYTES:
-        raise web.HTTPRequestEntityTooLarge(max_size=MAX_BODY_BYTES, actual_size=len(body))
+    body = await _read_body(request, MAX_BODY_BYTES)
     verify_webhook(
         settings.webhook_secret.get_secret_value(),
         request.headers,
@@ -443,10 +453,10 @@ def create_app(
     app.router.add_get("/api/v1/notion/status", notion_status)
     app.router.add_post("/api/v1/notion/sync", notion_sync_now)
     app.router.add_get("/api/v1/campaigns", campaigns_list)
-    app.router.add_post(r"/api/v1/campaigns/{campaign_id:\d+}/stop", campaign_stop)
+    app.router.add_post(r"/api/v1/campaigns/{campaign_id:\d{1,18}}/stop", campaign_stop)
     app.router.add_post("/api/v1/dnc", dnc_add)
     app.router.add_get("/api/v1/calls", calls_list)
-    app.router.add_post(r"/api/v1/calls/{attempt_id:\d+}/cancel", call_cancel)
+    app.router.add_post(r"/api/v1/calls/{attempt_id:\d{1,18}}/cancel", call_cancel)
     app.router.add_post("/api/v1/calls/stop-all", calls_stop_all)
     app.router.add_post(WEBHOOK_PATH, telephony_events)
     return app

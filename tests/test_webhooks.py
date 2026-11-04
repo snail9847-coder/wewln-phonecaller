@@ -1,5 +1,6 @@
 """Signed call-status webhooks and the calls endpoints of the local API."""
 
+import asyncio
 import json
 import logging
 import time
@@ -75,6 +76,7 @@ def test_signatures_are_checked_in_full():
         {**headers, "X-Wewln-Signature": good[:-1]},
         {**headers, "X-Wewln-Signature": sign_webhook("other" * 8, now, body)},
         {**headers, "X-Wewln-Timestamp": "abc"},
+        {**headers, "X-Wewln-Timestamp": "\u00b2" * 3},  # digits to str.isdigit(), not to int()
         {"X-Wewln-Signature": good},
     ):
         with pytest.raises(WebhookError):
@@ -146,10 +148,36 @@ async def test_oversized_and_invalid_events_are_refused(api):
         event(ticket.call_id, "hangup", cause=1000),
         event(ticket.call_id, "hangup", cause=True),
         event(ticket.call_id, "ringing", event_id="short"),
+        event(ticket.call_id, "ringing", event_id="evt-00000001\n"),
+        event(ticket.call_id + "\n", "ringing"),
     ):
         resp = await w.client.post(PATH, **signed(payload))
         assert resp.status == 400, payload
     assert w.store.get_attempt(ticket.attempt_id)["state"] == "dialing"
+
+
+async def test_a_body_that_arrives_in_pieces_is_read_whole(api):
+    w = await api()
+    ticket = a_call(w.store)
+    request = signed(event(ticket.call_id, "hangup", cause=16, cause_txt="Normal Clearing"))
+
+    async def pieces(body, size):
+        for start in range(0, len(body), size):
+            yield body[start : start + size]
+            await asyncio.sleep(0.01)
+
+    resp = await w.client.post(PATH, data=pieces(request["data"], 16), headers=request["headers"])
+    assert (resp.status, await resp.json()) == (200, {"result": "applied"})
+    assert w.store.get_attempt(ticket.attempt_id)["state"] != "dialing"
+    huge = signed(b'{"pad": "' + b"x" * MAX_BODY_BYTES + b'"}')
+    resp = await w.client.post(PATH, data=pieces(huge["data"], 16 * 1024), headers=huge["headers"])
+    assert resp.status == 413  # also without a Content-Length
+
+
+async def test_huge_ids_in_the_path_are_not_found(api):
+    w = await api()
+    for url in ("/api/v1/calls/" + "9" * 30 + "/cancel", "/api/v1/campaigns/" + "9" * 30 + "/stop"):
+        assert (await w.client.post(url, headers=AUTH)).status == 404  # not a 500
 
 
 async def test_nothing_secret_from_a_webhook_is_logged(api, caplog):

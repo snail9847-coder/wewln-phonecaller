@@ -67,9 +67,12 @@ class AriSimulator:
     # Substring of the dialed endpoint -> scenario name.
     scenarios: dict[str, str] = field(default_factory=dict)
     playback_seconds: float = 0.02
-    # "normal", "timeout" (no answer, no channel), "create_then_timeout", "error" (HTTP 500)
+    # "normal", "timeout" (no answer, no channel), "create_then_timeout", "error" (HTTP 500),
+    # "slow_create" (the channel appears, and the answer comes, only after post_delay)
     post_behavior: str = "normal"
     post_delay: float = 2.0
+    # "normal" or "error": GET /channels/{id} answers HTTP 500 (existence cannot be told)
+    get_behavior: str = "normal"
 
     def __post_init__(self) -> None:
         self.channels: dict[str, Channel] = {}
@@ -77,6 +80,7 @@ class AriSimulator:
         self.sockets: dict[str, web.WebSocketResponse] = {}
         self.ws_connects = 0
         self._seq = itertools.count(1)
+        self._background: set[asyncio.Future[Channel]] = set()
         self.base_url = ""
 
     # ------------------------------------------------------------------ helpers
@@ -223,6 +227,13 @@ class AriSimulator:
         if self.post_behavior == "timeout":
             await asyncio.sleep(self.post_delay)
             return web.json_response({"message": "late"}, status=500)
+        if self.post_behavior == "slow_create":
+            # Like Asterisk, finish a request that has arrived even if the client goes away
+            # (the test server cancels handlers of closed connections).
+            create = asyncio.ensure_future(self._create_later(channel_id, endpoint, app))
+            self._background.add(create)
+            create.add_done_callback(self._background.discard)
+            return web.json_response(self._channel_json(await asyncio.shield(create)))
         channel = Channel(id=channel_id, endpoint=endpoint, app=app)
         self.channels[channel_id] = channel
         channel.task = asyncio.create_task(self._run(channel, self.scenario_for(endpoint)))
@@ -230,7 +241,16 @@ class AriSimulator:
             await asyncio.sleep(self.post_delay)
         return web.json_response(self._channel_json(channel))
 
+    async def _create_later(self, channel_id: str, endpoint: str, app: str) -> Channel:
+        await asyncio.sleep(self.post_delay)
+        channel = Channel(id=channel_id, endpoint=endpoint, app=app)
+        self.channels[channel_id] = channel
+        channel.task = asyncio.create_task(self._run(channel, self.scenario_for(endpoint)))
+        return channel
+
     async def get_channel(self, request: web.Request) -> web.Response:
+        if self.get_behavior == "error":
+            return web.json_response({"message": "Internal error"}, status=500)
         channel = self.channels.get(request.match_info["id"])
         if channel is None:
             return web.json_response({"message": "Channel not found"}, status=404)
@@ -298,6 +318,8 @@ class AriSimulator:
         return application
 
     async def close(self) -> None:
+        for task in list(self._background):
+            task.cancel()
         for channel in list(self.channels.values()):
             if channel.task is not None:
                 channel.task.cancel()
