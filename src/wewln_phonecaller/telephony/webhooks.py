@@ -28,9 +28,9 @@ from .base import EventKind, ProviderEvent
 MAX_BODY_BYTES = 64 * 1024
 TIMESTAMP_HEADER = "X-Wewln-Timestamp"
 SIGNATURE_HEADER = "X-Wewln-Signature"
-_EVENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{8,100}$")
-_CALL_ID = re.compile(r"^wewln-[0-9a-f]{32}$")
-_SIGNATURE = re.compile(r"^v1=([0-9a-f]{64})$")
+_EVENT_ID = re.compile(r"[A-Za-z0-9_.:-]{8,100}")
+_CALL_ID = re.compile(r"wewln-[0-9a-f]{32}")
+_SIGNATURE = re.compile(r"v1=[0-9a-f]{64}")
 
 
 class WebhookError(WewlnError):
@@ -49,14 +49,14 @@ def verify_webhook(
 ) -> None:
     """Raise WebhookError unless the request is signed with `secret` and recent enough."""
     raw_ts = headers.get(TIMESTAMP_HEADER, "")
-    if not raw_ts.isdigit() or len(raw_ts) > 12:
+    if not (raw_ts.isascii() and raw_ts.isdigit()) or len(raw_ts) > 12:
         raise WebhookError("missing or invalid timestamp header")
     if abs(now - int(raw_ts)) > tolerance_s:
         raise WebhookError("the timestamp is too old or in the future (check the clock)")
     expected = sign_webhook(secret, int(raw_ts), body)
     supplied = [part.strip() for part in headers.get(SIGNATURE_HEADER, "").split(",")]
     if not any(
-        _SIGNATURE.match(value) and hmac.compare_digest(value.encode(), expected.encode())
+        _SIGNATURE.fullmatch(value) and hmac.compare_digest(value.encode(), expected.encode())
         for value in supplied
     ):
         raise WebhookError("invalid signature")
@@ -82,9 +82,9 @@ def parse_webhook_event(body: bytes) -> ProviderEvent:
     event_id = payload.get("event_id")
     call_id = payload.get("call_id")
     kind = payload.get("type")
-    if not isinstance(event_id, str) or not _EVENT_ID.match(event_id):
+    if not isinstance(event_id, str) or not _EVENT_ID.fullmatch(event_id):
         raise WebhookError("'event_id' must be 8-100 letters, digits or ._:-", http_status=400)
-    if not isinstance(call_id, str) or not _CALL_ID.match(call_id):
+    if not isinstance(call_id, str) or not _CALL_ID.fullmatch(call_id):
         raise WebhookError("'call_id' is not a wewln call ID", http_status=400)
     if kind not in {k.value for k in EventKind}:
         raise WebhookError(

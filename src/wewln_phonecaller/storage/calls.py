@@ -28,6 +28,7 @@ from ..telephony.lifecycle import (
     CONTACT_REMOVED,
     DO_NOT_CALL,
     JOB_CANCELLED,
+    KILL_SWITCH,
     OUTCOME_BY_STATE,
     TERMINAL_STATES,
     CallState,
@@ -439,10 +440,9 @@ class CallStore:
         unknown_call. A repeated event (same key) is never applied twice."""
         now = self.now()
         now_s = iso(now)
+        key = event.event_key[:200]  # the same (stored) key for the check and the insert
         with self.db.transaction() as conn:
-            if conn.execute(
-                "SELECT 1 FROM call_events WHERE event_key = ?", (event.event_key,)
-            ).fetchone():
+            if conn.execute("SELECT 1 FROM call_events WHERE event_key = ?", (key,)).fetchone():
                 return "duplicate"
             attempt = conn.execute(
                 "SELECT * FROM call_attempts WHERE provider_call_id = ?", (event.call_id,)
@@ -477,7 +477,7 @@ class CallStore:
                 "INSERT INTO call_events (event_key, source, provider_call_id, attempt_id, kind, "
                 "outcome, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    event.event_key[:200],
+                    key,
                     event.source[:30],
                     event.call_id[:100],
                     attempt["id"] if attempt is not None else None,
@@ -637,6 +637,51 @@ class CallStore:
                 )
         return bool(changed)
 
+    def dial_blocker(
+        self, attempt_id: int, *, phone_e164: str | None = None, real_test: bool = False
+    ) -> str | None:
+        """Why the attempt may not be dialed now (None: it may), read right before the dial
+        request: the attempt itself, the emergency stop, a cancel, the job, campaign, contact
+        and do-not-call state. `real_test`: a real test call also needs its permit to stand
+        (not revoked, not expired); otherwise RealCallsBlockedError."""
+        now_s = iso(self.now())
+        with self.db.connect(must_exist=True) as conn:
+            attempt = self._attempt(conn, attempt_id)
+            if CallState(attempt["state"]) != CallState.PENDING:
+                return attempt["end_reason"] or attempt["state"]
+            if attempt["end_request"]:
+                return attempt["end_request"]
+            if self._kill_switch(conn):
+                return KILL_SWITCH
+            if attempt["cancel_requested"]:
+                return attempt["cancel_requested"]
+            if attempt["kind"] == "job":
+                suppressed = {
+                    r[0] for r in conn.execute("SELECT DISTINCT phone_e164 FROM suppression")
+                }
+                return self._interrupt(conn, attempt, suppressed)
+            if phone_e164 and self._number_suppressed(conn, phone_e164):
+                return DO_NOT_CALL
+            if real_test:
+                permit = conn.execute(
+                    "SELECT 1 FROM real_call_permits WHERE phone_e164 = ? AND "
+                    "revoked_at IS NULL AND used > 0 AND expires_at > ? LIMIT 1",
+                    (phone_e164 or "", now_s),
+                ).fetchone()
+                if permit is None:
+                    raise RealCallsBlockedError(
+                        "the real-call permit for this number was revoked or has expired",
+                        details={"blocked_by": ["operator_not_armed"]},
+                    )
+        return None
+
+    def find_attempt(self, provider_call_id: str) -> dict[str, Any] | None:
+        with self.db.connect(must_exist=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM call_attempts WHERE provider_call_id = ?", (provider_call_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
     def active_attempts(self) -> list[dict[str, Any]]:
         """Live attempts with `interrupt`: why the call must end now, if anything changed
         (job cancelled, campaign stopped, contact removed or put on the do-not-call list).
@@ -754,11 +799,13 @@ class CallStore:
         return row is not None
 
     def revoke_permits(self, *, actor: str = "cli") -> int:
+        """Revoke every permit still in force: also one whose last use belongs to a call that
+        is about to be dialed (the check right before the dial request sees it)."""
         now_s = iso(self.now())
         with self.db.transaction() as conn:
             revoked = conn.execute(
                 "UPDATE real_call_permits SET revoked_at = ? WHERE revoked_at IS NULL "
-                "AND used < max_calls AND expires_at > ?",
+                "AND expires_at > ?",
                 (now_s, now_s),
             ).rowcount
             if revoked:

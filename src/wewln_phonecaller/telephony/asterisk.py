@@ -5,8 +5,10 @@ through the SIP trunk configured in its pjsip.conf; wewln never talks SIP itself
 docs/ASTERISK.md for the setup.
 
 - Calls are created with `POST /ari/channels/{channelId}`: the channel ID is derived from the
-  attempt's idempotency key, and Asterisk answers 409 for an ID that already exists.
-- The request that may have reached Asterisk without an answer is never repeated blindly.
+  attempt's idempotency key, and Asterisk answers 409 while a channel with that ID exists.
+- wewln sends the request for an attempt once. One that may have reached Asterisk without a
+  clear answer (no answer, or an error while the channel's existence cannot be checked) is
+  never repeated: the attempt is watched as a call that may exist.
 - After the answer the channel enters the Stasis application; until the voice engine arrives
   (Phase 5) wewln plays `answer_media` (if set) and hangs up.
 - The password travels only in the Authorization header (never in a URL) and is never logged.
@@ -403,9 +405,12 @@ class AsteriskAriProvider(TelephonyProvider):
         exists = await self.call_exists(request.call_id)
         if exists:
             return PlaceCallResult(request.call_id, already_existed=True)
-        if status is None:
+        if status is None or exists is None:
+            # No answer, or an error while Asterisk cannot even say whether the channel exists
+            # (a proxy's 502/504 may hide a call that was created): never sent again.
+            what = "did not answer" if status is None else f"answered HTTP {status}"
             raise ProviderUncertainError(
-                "Asterisk ARI did not answer the call request; it is not repeated automatically"
+                f"Asterisk ARI {what} to the call request; it is not repeated automatically"
             )
         raise ProviderError(f"Asterisk ARI error (HTTP {status})", code="ari_server_error")
 
